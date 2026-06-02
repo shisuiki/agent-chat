@@ -1,4 +1,6 @@
 import { afterAll, describe, expect, test, vi } from 'vitest';
+import path from 'path';
+import { pathToFileURL } from 'url';
 import { restoreEnv, snapshotEnv } from './helpers/env.js';
 
 // Set ACL env vars before importing the module
@@ -105,6 +107,40 @@ describe('command ACL (5.8.2)', () => {
       await bot.handle('!room1:test', '@random:evil.test', '!help', {});
       expect(replies).toHaveLength(1);
       expect(replies[0].body).not.toContain('Access denied');
+    });
+  });
+
+  describe('empty ACL defaults', () => {
+    test('empty ACL denies privileged commands while keeping !help public', async () => {
+      const emptyEnv = snapshotEnv(['MATRIX_OPERATOR_MXIDS', 'MATRIX_ADMIN_MXIDS']);
+      delete process.env.MATRIX_OPERATOR_MXIDS;
+      delete process.env.MATRIX_ADMIN_MXIDS;
+
+      try {
+        const moduleUrl = pathToFileURL(path.resolve('lib/bot-commands.js')).href;
+        const {
+          default: EmptyAclBotCommands,
+          authorizeCommand: authorizeWithEmptyAcl,
+        } = await import(`${moduleUrl}?empty-acl=${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+
+        expect(authorizeWithEmptyAcl('@random:evil.test', 0)).toEqual({ ok: true, reason: 'public' });
+        expect(authorizeWithEmptyAcl('@random:evil.test', 1)).toEqual({ ok: false, reason: 'operator_required' });
+        expect(authorizeWithEmptyAcl('@random:evil.test', 2)).toEqual({ ok: false, reason: 'operator_required' });
+        expect(authorizeWithEmptyAcl('@random:evil.test', 3)).toEqual({ ok: false, reason: 'admin_required' });
+
+        const replies = [];
+        const bot = new EmptyAclBotCommands({
+          botClient: { sendMessage: vi.fn(async (_roomId, content) => replies.push(content)) },
+          bridge: {},
+          botUserId: '@bot:matrix.test',
+        });
+        await bot.handle('!room1:test', '@random:evil.test', '!ctl send alpha hi', {});
+        expect(replies).toHaveLength(1);
+        expect(replies[0].body).toContain('Access denied');
+        expect(replies[0].body).toContain('admin');
+      } finally {
+        restoreEnv(emptyEnv);
+      }
     });
   });
 });

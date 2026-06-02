@@ -17,6 +17,7 @@ import { NotificationRouter } from './lib/notification-router.js';
 const __filename = fileURLToPath(import.meta.url);
 const execFileAsync = promisify(execFile);
 let execFileAsyncImpl = execFileAsync;
+let EventSourceImpl = EventSource;
 const REPO_ROOT = path.dirname(__filename);
 const RUNTIME_ROOT = (() => {
   const raw = String(process.env.AGENT_CHAT_RUNTIME_DIR || '').trim();
@@ -85,6 +86,10 @@ const MATRIX_GREETING_MXIDS = new Set(
 );
 const DATA_DIR = path.join(RUNTIME_ROOT, 'data', 'matrix');
 const MEDIA_DIR = path.join(DATA_DIR, 'media');
+const MATRIX_MEDIA_CACHE_MAX_BYTES_RAW = Number.parseInt(process.env.MATRIX_MEDIA_CACHE_MAX_BYTES || String(16 * 1024 * 1024), 10);
+const MATRIX_MEDIA_CACHE_MAX_BYTES = Number.isFinite(MATRIX_MEDIA_CACHE_MAX_BYTES_RAW) && MATRIX_MEDIA_CACHE_MAX_BYTES_RAW > 0
+  ? MATRIX_MEDIA_CACHE_MAX_BYTES_RAW
+  : 16 * 1024 * 1024;
 const AGENT_META_ROOT = path.join(RUNTIME_ROOT, 'data', 'agents');
 const AGENT_AVATAR_STYLE_VERSION = 2;
 
@@ -1208,6 +1213,36 @@ function mediaMetaFromContent(content) {
   return { mxc, mime, name, size };
 }
 
+async function responseBufferWithLimit(res, maxBytes) {
+  const lengthHeader = typeof res?.headers?.get === 'function' ? res.headers.get('content-length') : null;
+  const contentLength = Number.parseInt(lengthHeader, 10);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    return { error: `media exceeds max bytes (${maxBytes})` };
+  }
+
+  if (!res?.body || typeof res.body.getReader !== 'function') {
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > maxBytes) return { error: `media exceeds max bytes (${maxBytes})` };
+    return { buffer: buf };
+  }
+
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value);
+    total += chunk.length;
+    if (total > maxBytes) {
+      try { await reader.cancel(); } catch (_) {}
+      return { error: `media exceeds max bytes (${maxBytes})` };
+    }
+    chunks.push(chunk);
+  }
+  return { buffer: Buffer.concat(chunks, total) };
+}
+
 function buildInboundMediaBody(content, label) {
   const { name, mxc, mime, size } = mediaMetaFromContent(content);
   const httpUrl = mxc ? matrixMxcToHttpUrl(mxc) : null;
@@ -1261,6 +1296,14 @@ function parseInboundTextMessage(content) {
 function shouldIgnoreAgentForward(content) {
   const rawBody = typeof content?.body === 'string' ? content.body : '';
   return /^\[agentignore\]/i.test(rawBody);
+}
+
+function runSseHandler(label, handler) {
+  Promise.resolve()
+    .then(handler)
+    .catch((e) => {
+      console.warn(`Failed to handle SSE ${label} event: ${e?.message || e}`);
+    });
 }
 
 // ── Main bridge class ─────────────────────────────────────────────────
@@ -1474,8 +1517,12 @@ export class MatrixBridge {
   }
 
   async cacheInboundMediaToLocal(content) {
-    const { mxc, name, mime } = mediaMetaFromContent(content);
+    const { mxc, name, mime, size } = mediaMetaFromContent(content);
     if (!mxc) return null;
+    if (Number.isFinite(size) && size > MATRIX_MEDIA_CACHE_MAX_BYTES) {
+      console.warn(`Skipped Matrix media ${mxc}: media exceeds max bytes (${MATRIX_MEDIA_CACHE_MAX_BYTES})`);
+      return null;
+    }
     const mediaUrl = matrixMxcToClientMediaUrl(mxc);
     if (!mediaUrl) return null;
 
@@ -1506,7 +1553,12 @@ export class MatrixBridge {
     try {
       const res = await fetch(mediaUrl, { headers });
       if (!res.ok) return null;
-      const buf = Buffer.from(await res.arrayBuffer());
+      const body = await responseBufferWithLimit(res, MATRIX_MEDIA_CACHE_MAX_BYTES);
+      if (body.error) {
+        console.warn(`Skipped Matrix media ${mxc}: ${body.error}`);
+        return null;
+      }
+      const buf = body.buffer;
       const digest = createHash('sha256').update(buf).digest('hex').slice(0, 16);
       const filePath = path.join(MEDIA_DIR, `${Date.now()}-${digest}${ext}`);
       writeFileSync(filePath, buf);
@@ -1771,6 +1823,7 @@ export class MatrixBridge {
       const data = await res.json();
       if (data.room_id) {
         state.botDmRooms[dmKey] = data.room_id;
+        markRoomTrusted(data.room_id, { botDm: true, human: dmKey });
         saveState();
         return data.room_id;
       }
@@ -1897,7 +1950,6 @@ export class MatrixBridge {
   async onRoomMessage(roomId, event) {
     const eventId = event?.event_id || null;
     if (eventId && this.isDuplicateMatrixEvent(eventId)) return;
-    if (eventId) this.rememberMatrixEvent(eventId);
 
     if (shouldIgnoreAgentForward(event?.content)) return;
 
@@ -1983,12 +2035,14 @@ export class MatrixBridge {
       const context = { groupName, targetAgent };
       console.log(`Bot command from ${humanName} in ${groupName || targetAgent || 'bot-DM'}: ${cmdBody.slice(0, 80)}`);
       await this.commands.handle(roomId, senderId, cmdBody, context);
+      if (eventId) this.rememberMatrixEvent(eventId);
       return;
     }
 
     if (isBotDm) {
       // Non-command text in bot DM
       await this.commands.handle(roomId, senderId, body, {});
+      if (eventId) this.rememberMatrixEvent(eventId);
     } else if (targetAgent) {
       // DM to agent
       console.log(`Matrix DM: ${humanName} → ${targetAgent}: ${body.slice(0, 80)}`);
@@ -2002,6 +2056,7 @@ export class MatrixBridge {
         reply_to: replyTo,
         source: 'matrix',
         source_room: roomId,
+        source_event_id: eventId,
         target_type: 'agent',
         sender_mxid: senderId,
         trust_level: MATRIX_OPERATOR_MXIDS.has(senderId) ? 'operator' : 'external',
@@ -2026,6 +2081,7 @@ export class MatrixBridge {
         reply_to: replyTo,
         source: 'matrix',
         source_room: roomId,
+        source_event_id: eventId,
         sender_mxid: senderId,
         trust_level: MATRIX_OPERATOR_MXIDS.has(senderId) ? 'operator' : 'external',
       });
@@ -2445,13 +2501,13 @@ export class MatrixBridge {
 
     const connect = () => {
       if (currentEs) { try { currentEs.close(); } catch (_) {} currentEs = null; }
-      const es = new EventSource(url);
+      const es = new EventSourceImpl(url);
       currentEs = es;
       es.on('message', (data) => {
         try {
           const msg = JSON.parse(data);
           if (msg.source === 'matrix') return; // prevent loops
-          this.onAgentMessage(msg);
+          runSseHandler('message', () => this.onAgentMessage(msg));
         } catch (e) {
           console.warn(`Failed to parse SSE message event: ${e.message}`);
         }
@@ -2460,7 +2516,7 @@ export class MatrixBridge {
         try {
           const group = JSON.parse(data);
           console.log(`SSE: group created "${group.name}" with members: ${group.members.join(', ')}`);
-          this.onGroupCreated(group);
+          runSseHandler('group_created', () => this.onGroupCreated(group));
         } catch (e) {
           console.warn(`Failed to parse SSE group_created event: ${e.message}`);
         }
@@ -2469,7 +2525,7 @@ export class MatrixBridge {
         try {
           const update = JSON.parse(data);
           console.log(`SSE: group "${update.name}" members updated — added: [${update.added}], removed: [${update.removed}]`);
-          this.onGroupMembersChanged(update);
+          runSseHandler('group_members', () => this.onGroupMembersChanged(update));
         } catch (e) {
           console.warn(`Failed to parse SSE group_members event: ${e.message}`);
         }
@@ -2478,7 +2534,7 @@ export class MatrixBridge {
         try {
           const { agent, human, humanId } = JSON.parse(data);
           console.log(`SSE: dm_ensure request — agent=${agent}, human=${human}${humanId ? ` humanId=${humanId}` : ''}`);
-          this.onDmEnsure(agent, human, humanId || null);
+          runSseHandler('dm_ensure', () => this.onDmEnsure(agent, human, humanId || null));
         } catch (e) {
           console.warn(`Failed to parse SSE dm_ensure event: ${e.message}`);
         }
@@ -2488,7 +2544,7 @@ export class MatrixBridge {
           const { name, force, image, mime } = JSON.parse(data);
           if (image) {
             console.log(`SSE: agent_avatar custom upload — ${name} (${mime})`);
-            setCustomAgentAvatar(name, Buffer.from(image, 'base64'), mime || 'image/png');
+            runSseHandler('agent_avatar', () => setCustomAgentAvatar(name, Buffer.from(image, 'base64'), mime || 'image/png'));
           } else {
             console.log(`SSE: agent_avatar request — ${name}${force ? ' (force)' : ''}`);
             if (!AUTO_AVATAR_ENABLED) {
@@ -2496,7 +2552,7 @@ export class MatrixBridge {
               return;
             }
             if (force) delete state.agentAvatars[name];
-            ensureAgentAvatar(name);
+            runSseHandler('agent_avatar', () => ensureAgentAvatar(name));
           }
         } catch (e) {
           console.warn(`Failed to parse SSE agent_avatar event: ${e.message}`);
@@ -2505,7 +2561,7 @@ export class MatrixBridge {
       es.on('agent_blocked', (data) => {
         try {
           const event = JSON.parse(data);
-          this.onAgentBlocked(event);
+          runSseHandler('agent_blocked', () => this.onAgentBlocked(event));
         } catch (e) {
           console.warn(`Failed to parse SSE agent_blocked event: ${e.message}`);
         }
@@ -2513,7 +2569,7 @@ export class MatrixBridge {
       es.on('agent_recovered', (data) => {
         try {
           const event = JSON.parse(data);
-          this.onAgentRecovered(event);
+          runSseHandler('agent_recovered', () => this.onAgentRecovered(event));
         } catch (e) {
           console.warn(`Failed to parse SSE agent_recovered event: ${e.message}`);
         }
@@ -2521,7 +2577,7 @@ export class MatrixBridge {
       es.on('system_info', (data) => {
         try {
           const event = JSON.parse(data);
-          this.onSystemInfo(event);
+          runSseHandler('system_info', () => this.onSystemInfo(event));
         } catch (e) {
           console.warn(`Failed to parse SSE system_info event: ${e.message}`);
         }
@@ -2529,7 +2585,7 @@ export class MatrixBridge {
       es.on('agent_compact', (data) => {
         try {
           const event = JSON.parse(data);
-          this.onAgentCompact(event);
+          runSseHandler('agent_compact', () => this.onAgentCompact(event));
         } catch (e) {
           console.warn(`Failed to parse SSE agent_compact event: ${e.message}`);
         }
@@ -3452,12 +3508,14 @@ export async function generateAvatarPngForTest(name, options = {}) {
   return generateAvatarPng(name, options);
 }
 
-export function setBridgeMatrixTestHooks({ execFileAsync: overrideExecFileAsync } = {}) {
+export function setBridgeMatrixTestHooks({ execFileAsync: overrideExecFileAsync, eventSource: overrideEventSource } = {}) {
   execFileAsyncImpl = typeof overrideExecFileAsync === 'function' ? overrideExecFileAsync : execFileAsync;
+  if (typeof overrideEventSource === 'function') EventSourceImpl = overrideEventSource;
 }
 
 export function resetBridgeMatrixTestHooks() {
   execFileAsyncImpl = execFileAsync;
+  EventSourceImpl = EventSource;
 }
 
 export function resolveMessageBaseUrlForTest(env = {}) {
@@ -3466,6 +3524,10 @@ export function resolveMessageBaseUrlForTest(env = {}) {
 
 export function buildMessageUrlForTest(messageId, viewToken = null, baseUrl = MSG_BASE_URL) {
   return buildMessageUrl(messageId, viewToken, baseUrl);
+}
+
+export function runSseHandlerForTest(label, handler) {
+  return runSseHandler(label, handler);
 }
 
 // Test exports for 5.8.1 room trust

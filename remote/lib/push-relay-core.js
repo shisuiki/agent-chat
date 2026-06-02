@@ -787,9 +787,9 @@ function messageRecipients(msg) {
 }
 
 function shouldHandleDirectMessage(msg) {
-  // Local and remote relay both handle all message sources for delivery.
-  // Runtime observation (blocked/active/mcpPresent) is skipped in local mode
-  // by scanBlockedStates, but delivery must always work.
+  // Local Matrix-origin message SSE is a backend notification of work already
+  // owned by the dashboard queue; direct local injection would duplicate it.
+  if (!PUSH_RELAY_REMOTE_MODE && msg?.source === 'matrix') return false;
   return true;
 }
 

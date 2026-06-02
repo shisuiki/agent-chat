@@ -303,6 +303,43 @@ describe('provenance metadata (5.8.3 Layer 1)', () => {
     }
   });
 
+  test('wrong bridge secret cannot activate Matrix source event dedupe', async () => {
+    process.env.MATRIX_BRIDGE_SECRET = 'test-secret-abc';
+    try {
+      const payload = {
+        from: 'system',
+        to: 'alice',
+        type: 'human',
+        summary: 'bridge source event bad secret',
+        full: 'bridge source event bad secret',
+        source: 'matrix',
+        source_room: '!bad-secret:matrix.test',
+        source_event_id: '$bad-secret-event',
+        sender_mxid: '@ops:matrix.test',
+      };
+      const first = await request(app)
+        .post('/api/messages')
+        .set('X-Bridge-Secret', 'wrong-secret')
+        .send(payload);
+      const second = await request(app)
+        .post('/api/messages')
+        .set('X-Bridge-Secret', 'wrong-secret')
+        .send(payload);
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(second.body.id).not.toBe(first.body.id);
+      expect(second.body.duplicate).toBeUndefined();
+
+      const inboxRes = await request(app).get('/api/inbox/alice');
+      const rows = inboxRes.body.dm.filter(m => m.summary === 'bridge source event bad secret');
+      expect(rows).toHaveLength(2);
+      expect(rows.map(m => m.sourceEventId)).toEqual([null, null]);
+    } finally {
+      delete process.env.MATRIX_BRIDGE_SECRET;
+    }
+  });
+
   test('missing bridge secret header rejects when MATRIX_BRIDGE_SECRET is set', async () => {
     process.env.MATRIX_BRIDGE_SECRET = 'test-secret-abc';
     try {

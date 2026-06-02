@@ -4073,6 +4073,7 @@ function summarizeMsg(m) {
     group: m.group || null,
     source: m.source || 'api',
     sourceRoom: m.sourceRoom || null,
+    sourceEventId: m.sourceEventId || null,
     senderMxid: m.senderMxid || null,
     trustLevel: m.trustLevel || null,
     fromId: m.fromId || null,
@@ -4468,6 +4469,27 @@ function hasMessageViewTokenAccess(req, msg) {
   const token = normalizeOptionalText(req.query?.view || req.query?.view_token || req.query?.token, 256);
   if (!token || !msg?.viewToken) return false;
   return constantTimeStringEqual(token, msg.viewToken);
+}
+
+function findMatrixSourceMessage(sourceRoom, sourceEventId) {
+  if (!sourceRoom || !sourceEventId) return null;
+  return messages.find((msg) => {
+    const source = typeof msg?.source === 'string' ? msg.source.trim().toLowerCase() : 'api';
+    return source === 'matrix'
+      && msg.sourceRoom === sourceRoom
+      && msg.sourceEventId === sourceEventId;
+  }) || null;
+}
+
+function buildDuplicateMessageResponse(msg) {
+  return {
+    ok: true,
+    id: msg.id,
+    duplicate: true,
+    warnings: [],
+    delivery: { suppressed: msg.suppressedRecipients || [], targetKind: null },
+    taskGraph: null,
+  };
 }
 
 function authorizeMessageDetailAccess(req, msg, options = {}) {
@@ -9774,7 +9796,7 @@ app.get('/api/media/fetch', (req, res) => {
 
 // ── Messages ──────────────────────────────────────────────────────────
 app.post('/api/messages', requireAgentToken(_tokenFromBody), (req, res) => {
-  const { from, to, group, type, summary, full, mentions, reply_to, source, target_type, source_room, attachments, schema, priority, sender_mxid, from_id } = req.body;
+  const { from, to, group, type, summary, full, mentions, reply_to, source, target_type, source_room, attachments, schema, priority, sender_mxid, from_id, source_event_id, matrix_event_id } = req.body;
   const fromName = normalizeAgentName(from) || from;
   const toName = to ? normalizeAgentName(to) : null;
   const sourceType = typeof source === 'string' ? source.trim().toLowerCase() : 'api';
@@ -9787,6 +9809,10 @@ app.post('/api/messages', requireAgentToken(_tokenFromBody), (req, res) => {
   const isBridgeAuthenticated = !bridgeSecret || req.headers['x-bridge-secret'] === bridgeSecret;
   const senderMxid = isBridgeAuthenticated && sourceType === 'matrix' && typeof sender_mxid === 'string' && /^@[^:]+:.+/.test(sender_mxid.trim())
     ? sender_mxid.trim().slice(0, 255) : null;
+  const rawSourceEventId = typeof source_event_id === 'string' ? source_event_id : matrix_event_id;
+  const sourceEventId = isBridgeAuthenticated && sourceType === 'matrix' && sourceRoom
+    ? normalizeOptionalText(rawSourceEventId, 512)
+    : null;
   // Derive trustLevel server-side from validated senderMxid — never trust caller-supplied value
   const trustLevel = senderMxid ? (MATRIX_OPERATOR_MXIDS.has(senderMxid) ? 'operator' : 'external') : null;
   // Normalize literal \n (two chars) to actual newlines — some agents double-escape them
@@ -9830,6 +9856,10 @@ app.post('/api/messages', requireAgentToken(_tokenFromBody), (req, res) => {
   }
   if (!['auto', 'agent', 'human'].includes(targetType)) {
     return res.status(400).json({ error: 'target_type must be one of: auto, agent, human' });
+  }
+  const duplicateMatrixMessage = findMatrixSourceMessage(sourceRoom, sourceEventId);
+  if (duplicateMatrixMessage) {
+    return res.json(buildDuplicateMessageResponse(duplicateMatrixMessage));
   }
   let directTargetKind = null;
   let assumedHumanTarget = false;
@@ -9940,6 +9970,7 @@ app.post('/api/messages', requireAgentToken(_tokenFromBody), (req, res) => {
     reply_to: reply_to || null,
     source: source || 'api',
     sourceRoom,
+    sourceEventId,
     senderMxid,
     trustLevel,
     fromId: isBridgeAuthenticated && (typeof from_id === 'string' && from_id.trim()) ? from_id.trim().slice(0, 255)

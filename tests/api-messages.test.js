@@ -152,6 +152,59 @@ describe('backend message API', () => {
     expect(response.body).toEqual({ error: 'schema.kind required' });
   });
 
+  test('Matrix source event ID dedupes retries without replaying accept side effects', async () => {
+    const previousBridgeSecret = process.env.MATRIX_BRIDGE_SECRET;
+    process.env.MATRIX_BRIDGE_SECRET = 'matrix-idempotency-secret';
+
+    try {
+      const payload = {
+        from: 'system',
+        to: 'alpha',
+        type: 'human',
+        summary: 'matrix idempotent body',
+        full: 'matrix idempotent body',
+        source: 'matrix',
+        source_room: '!idem:matrix.test',
+        source_event_id: '$idem-event-1',
+        sender_mxid: '@human:matrix.test',
+      };
+
+      const first = await request(context.app)
+        .post('/api/messages')
+        .set('X-Bridge-Secret', 'matrix-idempotency-secret')
+        .send(payload);
+      expect(first.status).toBe(200);
+      expect(first.body).toMatchObject({ ok: true });
+      expect(first.body.duplicate).toBeUndefined();
+
+      const second = await request(context.app)
+        .post('/api/messages')
+        .set('X-Bridge-Secret', 'matrix-idempotency-secret')
+        .send(payload);
+      expect(second.status).toBe(200);
+      expect(second.body).toMatchObject({
+        ok: true,
+        id: first.body.id,
+        duplicate: true,
+        warnings: [],
+        delivery: { suppressed: [], targetKind: null },
+        taskGraph: null,
+      });
+
+      const persisted = readPersistedMessages(context.runtimeDir)
+        .filter((message) => message.sourceRoom === '!idem:matrix.test' && message.sourceEventId === '$idem-event-1');
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0].id).toBe(first.body.id);
+
+      const acceptedEvents = readDeliveryEvents(context.runtimeDir)
+        .filter((event) => event.type === 'message.accepted' && event.messageId === first.body.id);
+      expect(acceptedEvents).toHaveLength(1);
+    } finally {
+      if (previousBridgeSecret === undefined) delete process.env.MATRIX_BRIDGE_SECRET;
+      else process.env.MATRIX_BRIDGE_SECRET = previousBridgeSecret;
+    }
+  });
+
   test('message suppression appends a delivery event', async () => {
     const createResponse = await request(context.app)
       .post('/api/messages')

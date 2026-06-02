@@ -129,6 +129,105 @@ describe('bridge matrix behavior', () => {
     expect(bridge.submitHumanMessage).not.toHaveBeenCalled();
   });
 
+  test('onRoomMessage forwards Matrix event IDs for agent DMs and records accepted IDs', async () => {
+    const bridge = new MatrixBridge();
+    bridge.botUserId = '@agent-bridge:matrix.example.test';
+    bridge.submitHumanMessage = vi.fn().mockResolvedValue({ ok: true, id: 'msg_from_dm' });
+    bridge.botClient = {
+      getJoinedRoomMembers: vi.fn().mockResolvedValue([
+        '@agent-bridge:matrix.example.test',
+        '@ac_alpha:matrix.example.test',
+        '@alice:matrix.example.test',
+      ]),
+    };
+
+    await bridge.onRoomMessage('!dm:test', {
+      event_id: '$dm-event-1',
+      sender: '@alice:matrix.example.test',
+      content: {
+        msgtype: 'm.text',
+        body: 'hello alpha',
+      },
+    });
+
+    expect(bridge.submitHumanMessage).toHaveBeenCalledWith('!dm:test', expect.objectContaining({
+      from: 'alice',
+      to: 'alpha',
+      source: 'matrix',
+      source_room: '!dm:test',
+      source_event_id: '$dm-event-1',
+      sender_mxid: '@alice:matrix.example.test',
+    }));
+    expect(bridge.resolveReplyToMessageId('$dm-event-1')).toBe('msg_from_dm');
+  });
+
+  test('onRoomMessage forwards Matrix event IDs for group messages', async () => {
+    const bridge = new MatrixBridge();
+    bridge.botUserId = '@agent-bridge:matrix.example.test';
+    bridge.submitHumanMessage = vi.fn().mockResolvedValue({ ok: true, id: 'msg_from_group' });
+    bridge.botClient = {
+      getJoinedRoomMembers: vi.fn().mockResolvedValue([
+        '@agent-bridge:matrix.example.test',
+        '@alice:matrix.example.test',
+        '@bob:matrix.example.test',
+      ]),
+    };
+    bridge.getBridgeState().roomGroupMap['!group:test'] = 'dev';
+    bridge.getBridgeState().groupRoomMap.dev = '!group:test';
+
+    await bridge.onRoomMessage('!group:test', {
+      event_id: '$group-event-1',
+      sender: '@alice:matrix.example.test',
+      content: {
+        msgtype: 'm.text',
+        body: 'hello group',
+      },
+    });
+
+    expect(bridge.submitHumanMessage).toHaveBeenCalledWith('!group:test', expect.objectContaining({
+      from: 'alice',
+      group: 'dev',
+      source: 'matrix',
+      source_room: '!group:test',
+      source_event_id: '$group-event-1',
+      sender_mxid: '@alice:matrix.example.test',
+    }));
+    expect(bridge.resolveReplyToMessageId('$group-event-1')).toBe('msg_from_group');
+  });
+
+  test('ensureBotDmRoom trusts newly created bot DMs immediately in enforce mode', async () => {
+    const trustRuntimeDir = mkdtempSync(path.join(os.tmpdir(), 'agent-chat-bridge-trust-dm-'));
+    const trustEnv = snapshotEnv([
+      'AGENT_CHAT_RUNTIME_DIR',
+      'MATRIX_TRUST_MODE',
+    ]);
+
+    try {
+      process.env.AGENT_CHAT_RUNTIME_DIR = trustRuntimeDir;
+      process.env.MATRIX_TRUST_MODE = 'enforce';
+      const bridgeUrl = pathToFileURL(path.resolve('bridge-matrix.js')).href;
+      const {
+        MatrixBridge: EnforceBridge,
+        getRoomTrust: getEnforceRoomTrust,
+      } = await import(`${bridgeUrl}?test=bot-dm-trust-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+      const bridge = new EnforceBridge();
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        json: vi.fn().mockResolvedValue({ room_id: '!bot-dm:test' }),
+      }));
+
+      await expect(bridge.ensureBotDmRoom('alice', '@alice:matrix.example.test'))
+        .resolves.toBe('!bot-dm:test');
+
+      expect(getEnforceRoomTrust('!bot-dm:test')).toEqual(expect.objectContaining({
+        trusted: true,
+        reason: 'managed',
+      }));
+    } finally {
+      restoreEnv(trustEnv);
+      rmSync(trustRuntimeDir, { recursive: true, force: true });
+    }
+  });
+
   test('pollRegistrations fetches agent names via view=names and provisions new tokens', async () => {
     const bridge = new MatrixBridge();
     bridge.callBackendApi = vi.fn().mockResolvedValue(['alpha', 'beta']);
@@ -295,6 +394,49 @@ describe('bridge matrix behavior', () => {
     );
   });
 
+  test('cacheInboundMediaToLocal refuses oversized media before buffering', async () => {
+    const mediaRuntimeDir = mkdtempSync(path.join(os.tmpdir(), 'agent-chat-bridge-media-limit-'));
+    const mediaEnv = snapshotEnv([
+      'AGENT_CHAT_RUNTIME_DIR',
+      'MATRIX_MEDIA_CACHE_MAX_BYTES',
+    ]);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      process.env.AGENT_CHAT_RUNTIME_DIR = mediaRuntimeDir;
+      process.env.MATRIX_MEDIA_CACHE_MAX_BYTES = '4';
+      const bridgeUrl = pathToFileURL(path.resolve('bridge-matrix.js')).href;
+      const { MatrixBridge: MediaBridge } = await import(`${bridgeUrl}?test=media-limit-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+      const bridge = new MediaBridge();
+      const arrayBuffer = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3, 4, 5]).buffer);
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        headers: { get: vi.fn((name) => (name === 'content-length' ? '5' : null)) },
+        arrayBuffer,
+      }));
+
+      await expect(bridge.cacheInboundMediaToLocal({
+        url: 'mxc://matrix.example.test/media-by-size',
+        body: 'large.bin',
+        info: { size: 5 },
+      })).resolves.toBeNull();
+      expect(fetch).not.toHaveBeenCalled();
+
+      await expect(bridge.cacheInboundMediaToLocal({
+        url: 'mxc://matrix.example.test/media-by-length',
+        body: 'large.bin',
+        info: {},
+      })).resolves.toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(arrayBuffer).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('media exceeds max bytes (4)'));
+    } finally {
+      warnSpy.mockRestore();
+      restoreEnv(mediaEnv);
+      rmSync(mediaRuntimeDir, { recursive: true, force: true });
+    }
+  });
+
   test('postWarning deduplicates the same warning family within the window', async () => {
     const bridge = new MatrixBridge();
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
@@ -340,6 +482,50 @@ describe('bridge matrix behavior', () => {
     // Circuit should be open — 4th call should be suppressed
     bridge.postWarning('err4', { kind: 'a', scope: '4' });
     expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  test('connectSSE contains async handler rejections locally', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const unhandled = [];
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+
+    class FakeEventSource {
+      static instances = [];
+
+      constructor(url) {
+        this.url = url;
+        this.handlers = new Map();
+        FakeEventSource.instances.push(this);
+      }
+
+      on(name, handler) {
+        this.handlers.set(name, handler);
+      }
+
+      close() {}
+
+      emit(name, data) {
+        this.handlers.get(name)?.(data);
+      }
+    }
+
+    try {
+      setBridgeMatrixTestHooks({ eventSource: FakeEventSource });
+      const bridge = new MatrixBridge();
+      bridge.onAgentMessage = vi.fn().mockRejectedValue(new Error('handler down'));
+
+      bridge.connectSSE();
+      FakeEventSource.instances[0].emit('message', JSON.stringify({ id: 'msg_sse', source: 'backend' }));
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(bridge.onAgentMessage).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith('Failed to handle SSE message event: handler down');
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      warnSpy.mockRestore();
+    }
   });
 
   test('onSystemInfo filters info alerts and cools down warning alerts', async () => {

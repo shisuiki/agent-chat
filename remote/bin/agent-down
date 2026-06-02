@@ -288,10 +288,6 @@ if data.get("error"):
     print(f"error:{data.get('error')}")
     raise SystemExit(0)
 
-active = data.get("activeNow") is True
-online = data.get("online") is True
-active_dur = int(data.get("activeDurationSec") or 0)
-idle_dur = int(data.get("idleDurationSec") or 0)
 now_ms = int(__import__("time").time() * 1000)
 fresh_ms_raw = os.environ.get("AGENT_DOWN_ACTIVITY_FRESH_MS", "120000")
 try:
@@ -300,27 +296,34 @@ except Exception:
     fresh_ms = 120000
 fresh_ms = max(1, fresh_ms)
 
-if active:
-    print(f"active:{name}:online={int(online)}:activeDurationSec={active_dur}:idleDurationSec={idle_dur}")
-    raise SystemExit(0)
-
-if data.get("activeNow") is not False:
-    print(f"error:unknown-runtime-status:activeNow={data.get('activeNow')!r}")
-    raise SystemExit(0)
-
 observation = data.get("runtimeObservation")
-if not isinstance(observation, dict):
-    print("error:stale-runtime-status:missing-runtime-observation")
-    raise SystemExit(0)
-source = str(observation.get("observerSource") or "").strip()
-try:
-    observed_at = int(observation.get("observedAt") or 0)
-except Exception:
-    observed_at = 0
+source = ""
+observed_at = 0
+if isinstance(observation, dict):
+    source = str(observation.get("observerSource") or "").strip()
+    try:
+        observed_at = int(observation.get("observedAt") or 0)
+    except Exception:
+        observed_at = 0
+active_value = data.get("activeNow")
+online = data.get("online") is True
+active_dur = int(data.get("activeDurationSec") or 0)
+idle_dur = int(data.get("idleDurationSec") or 0)
 fresh_sources = {"runtime-api", "local-sweep"}
 age_ms = now_ms - observed_at if observed_at > 0 else fresh_ms + 1
+if not isinstance(observation, dict):
+    print(f"stale:{name}:reason=missing-runtime-observation:activeNow={active_value!r}:online={int(online)}:activeDurationSec={active_dur}:idleDurationSec={idle_dur}:source=-:ageMs={age_ms}:freshMs={fresh_ms}")
+    raise SystemExit(0)
 if source not in fresh_sources or observed_at <= 0 or age_ms < 0 or age_ms > fresh_ms:
-    print(f"error:stale-runtime-status:source={source or '-'}:ageMs={age_ms}:freshMs={fresh_ms}")
+    print(f"stale:{name}:reason=stale-runtime-observation:activeNow={active_value!r}:online={int(online)}:activeDurationSec={active_dur}:idleDurationSec={idle_dur}:source={source or '-'}:ageMs={age_ms}:freshMs={fresh_ms}")
+    raise SystemExit(0)
+
+if active_value is True:
+    print(f"active:{name}:online={int(online)}:activeDurationSec={active_dur}:idleDurationSec={idle_dur}:source={source}:ageMs={age_ms}")
+    raise SystemExit(0)
+
+if active_value is not False:
+    print(f"error:unknown-runtime-status:activeNow={active_value!r}:source={source}:ageMs={age_ms}")
     raise SystemExit(0)
 
 print(f"inactive:{name}:online={int(online)}:activeDurationSec={active_dur}:idleDurationSec={idle_dur}:source={source}:ageMs={age_ms}")
@@ -337,6 +340,10 @@ PY
     inactive:*)
       echo "Verified '$NAME' is not active (${status#inactive:})."
       ;;
+    stale:*)
+      echo "Backend active-status observation is stale for '$NAME' (${status#stale:})." >&2
+      verify_local_pane_not_active "${status#stale:}"
+      ;;
     error:*)
       echo "Error: unable to verify active status for '$NAME' (${status#error:})." >&2
       echo "Refusing to stop agent to avoid interrupting active work." >&2
@@ -348,6 +355,89 @@ PY
       exit 1
       ;;
   esac
+}
+
+local_pane_activity_status() {
+  local pane_text="$1"
+  PANE_TEXT="$pane_text" python3 - <<'PY'
+import os
+import re
+
+ansi_re = re.compile(r"\x1B\[[0-9;?]*[ -/]*[@-~]")
+text = ansi_re.sub("", os.environ.get("PANE_TEXT", ""))
+lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+recent = "\n".join(lines[-14:])
+patterns = [
+    (r"\b(?:Working|Running|Thinking|Processing)\b[^\n]*\besc to interrupt\b", "interactive-client-working"),
+    (r"\besc to interrupt\b[^\n]*\b(?:Working|Running|Thinking|Processing)\b", "interactive-client-working"),
+]
+for pattern, reason in patterns:
+    if re.search(pattern, recent, re.I):
+        print(f"active:{reason}")
+        raise SystemExit(0)
+print("inactive:no-busy-marker")
+PY
+}
+
+verify_local_pane_not_active() {
+  local stale_detail="${1:-stale-runtime-status}"
+  local probe_ms_raw probe_ms probe_sec pane_text_first pane_text_second status_first status_second
+
+  if ! pane_text_first="$(tmux capture-pane -t "$TMUX_PANE_TARGET" -p -S -200 2>/dev/null)"; then
+    echo "Error: unable to verify local pane activity for '$NAME' after stale backend status." >&2
+    echo "Details: $stale_detail" >&2
+    echo "Refusing to stop agent to avoid interrupting active work." >&2
+    exit 1
+  fi
+  status_first="$(local_pane_activity_status "$pane_text_first")"
+  case "$status_first" in
+    active:*)
+      echo "Error: local pane for '$NAME' appears active (${status_first#active:})." >&2
+      echo "Details: $stale_detail" >&2
+      echo "Refusing to stop active agent." >&2
+      exit 1
+      ;;
+  esac
+
+  probe_ms_raw="${AGENT_DOWN_LOCAL_IDLE_PROBE_MS:-1500}"
+  if [[ "$probe_ms_raw" =~ ^[0-9]+$ ]]; then
+    probe_ms="$probe_ms_raw"
+  else
+    probe_ms=1500
+  fi
+  if [ "$probe_ms" -gt 0 ]; then
+    probe_sec=$(PROBE_MS="$probe_ms" python3 - <<'PY'
+import os
+print(f"{max(0, int(os.environ.get('PROBE_MS') or 0)) / 1000:.3f}")
+PY
+)
+    sleep "$probe_sec"
+  fi
+
+  if ! pane_text_second="$(tmux capture-pane -t "$TMUX_PANE_TARGET" -p -S -200 2>/dev/null)"; then
+    echo "Error: unable to re-check local pane activity for '$NAME' after stale backend status." >&2
+    echo "Details: $stale_detail" >&2
+    echo "Refusing to stop agent to avoid interrupting active work." >&2
+    exit 1
+  fi
+  status_second="$(local_pane_activity_status "$pane_text_second")"
+  case "$status_second" in
+    active:*)
+      echo "Error: local pane for '$NAME' appears active (${status_second#active:})." >&2
+      echo "Details: $stale_detail" >&2
+      echo "Refusing to stop active agent." >&2
+      exit 1
+      ;;
+  esac
+
+  if [ "$pane_text_first" != "$pane_text_second" ]; then
+    echo "Error: local pane for '$NAME' changed during stale-status verification." >&2
+    echo "Details: $stale_detail" >&2
+    echo "Refusing to stop agent to avoid interrupting active work." >&2
+    exit 1
+  fi
+
+  echo "Verified '$NAME' is not active by local pane probe (${status_second#inactive:}; backend ${stale_detail})."
 }
 
 for arg in "$@"; do

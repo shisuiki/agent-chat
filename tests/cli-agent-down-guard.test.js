@@ -37,8 +37,21 @@ case "$1" in
     exit 0
     ;;
   capture-pane)
-    printf 'archive tail\\n'
-    printf 'codex resume 00000000-0000-0000-0000-000000000000\\n'
+    capture_count_file="$TMUX_FAKE_STATE/capture-count"
+    capture_count=0
+    if [ -f "$capture_count_file" ]; then
+      capture_count="$(cat "$capture_count_file")"
+    fi
+    capture_count=$((capture_count + 1))
+    printf '%s' "$capture_count" > "$capture_count_file"
+    if [ "$capture_count" -ge 2 ] && [ -n "\${TMUX_FAKE_CAPTURE_TEXT_SECOND:-}" ]; then
+      printf '%s\\n' "$TMUX_FAKE_CAPTURE_TEXT_SECOND"
+    elif [ -n "\${TMUX_FAKE_CAPTURE_TEXT:-}" ]; then
+      printf '%s\\n' "$TMUX_FAKE_CAPTURE_TEXT"
+    else
+      printf 'archive tail\\n'
+      printf 'codex resume 00000000-0000-0000-0000-000000000000\\n'
+    fi
     exit 0
     ;;
   kill-session)
@@ -155,7 +168,30 @@ describe('agent-down active-work guard', () => {
     expect(log).not.toContain('kill-session');
   });
 
-  test('refuses --kill when inactive runtime activity is stale', async () => {
+  test('refuses --kill when fresh runtime activity is active', async () => {
+    context = await createBackendTestContext('agent-chat-agent-down-active-test-', seedAgent(true, {
+      observerSource: 'runtime-api',
+      observerServer: 'local',
+      observedAt: Date.now(),
+    }));
+    listener = await context.listen();
+    const tmux = setupFakeTmux();
+
+    const result = await runAgentDown(['alpha', '--kill'], {
+      ...tmux.env,
+      AGENT_CHAT_API: listener.baseUrl,
+      AGENT_CHAT_RUNTIME_DIR: context.runtimeDir,
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('currently active');
+    const log = readFakeTmuxLog(tmux.logPath);
+    expect(log).toContain('has-session');
+    expect(log).not.toContain('capture-pane');
+    expect(log).not.toContain('kill-session');
+  });
+
+  test('allows --kill when inactive runtime activity is stale but local pane is idle', async () => {
     context = await createBackendTestContext('agent-chat-agent-down-stale-test-', seedAgent(false, {
       observerSource: 'runtime-api',
       observerServer: 'local',
@@ -169,13 +205,96 @@ describe('agent-down active-work guard', () => {
       AGENT_CHAT_API: listener.baseUrl,
       AGENT_CHAT_RUNTIME_DIR: context.runtimeDir,
       AGENT_DOWN_ACTIVITY_FRESH_MS: '120000',
+      AGENT_DOWN_LOCAL_IDLE_PROBE_MS: '0',
+      TMUX_FAKE_CAPTURE_TEXT: '> ready for the next task',
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain('Backend active-status observation is stale');
+    expect(result.stdout).toContain("Verified 'alpha' is not active by local pane probe");
+    const log = readFakeTmuxLog(tmux.logPath);
+    expect(log).toContain('has-session');
+    expect(log).toContain('capture-pane');
+    expect(log).toContain('kill-session');
+  });
+
+  test('treats fresh mcp heartbeat as non-activity evidence and probes the local pane', async () => {
+    context = await createBackendTestContext('agent-chat-agent-down-mcp-heartbeat-test-', seedAgent(false, {
+      observerSource: 'mcp-heartbeat',
+      observerServer: 'local',
+      observedAt: Date.now(),
+    }));
+    listener = await context.listen();
+    const tmux = setupFakeTmux();
+
+    const result = await runAgentDown(['alpha', '--kill'], {
+      ...tmux.env,
+      AGENT_CHAT_API: listener.baseUrl,
+      AGENT_CHAT_RUNTIME_DIR: context.runtimeDir,
+      AGENT_DOWN_ACTIVITY_FRESH_MS: '120000',
+      AGENT_DOWN_LOCAL_IDLE_PROBE_MS: '0',
+      TMUX_FAKE_CAPTURE_TEXT: '> ready for the next task',
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain('source=mcp-heartbeat');
+    expect(result.stdout).toContain("Verified 'alpha' is not active by local pane probe");
+    const log = readFakeTmuxLog(tmux.logPath);
+    expect(log).toContain('capture-pane');
+    expect(log).toContain('kill-session');
+  });
+
+  test('refuses --kill when stale runtime activity has a busy local pane', async () => {
+    context = await createBackendTestContext('agent-chat-agent-down-stale-busy-test-', seedAgent(false, {
+      observerSource: 'runtime-api',
+      observerServer: 'local',
+      observedAt: Date.now() - 300000,
+    }));
+    listener = await context.listen();
+    const tmux = setupFakeTmux();
+
+    const result = await runAgentDown(['alpha', '--kill'], {
+      ...tmux.env,
+      AGENT_CHAT_API: listener.baseUrl,
+      AGENT_CHAT_RUNTIME_DIR: context.runtimeDir,
+      AGENT_DOWN_ACTIVITY_FRESH_MS: '120000',
+      AGENT_DOWN_LOCAL_IDLE_PROBE_MS: '0',
+      TMUX_FAKE_CAPTURE_TEXT: 'Working (12m 04s - esc to interrupt)',
     });
 
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain('stale-runtime-status');
+    expect(result.stderr).toContain('local pane');
+    expect(result.stderr).toContain('appears active');
     const log = readFakeTmuxLog(tmux.logPath);
     expect(log).toContain('has-session');
-    expect(log).not.toContain('capture-pane');
+    expect(log).toContain('capture-pane');
+    expect(log).not.toContain('kill-session');
+  });
+
+  test('refuses --kill when stale runtime activity has a changing local pane', async () => {
+    context = await createBackendTestContext('agent-chat-agent-down-stale-changing-test-', seedAgent(false, {
+      observerSource: 'runtime-api',
+      observerServer: 'local',
+      observedAt: Date.now() - 300000,
+    }));
+    listener = await context.listen();
+    const tmux = setupFakeTmux();
+
+    const result = await runAgentDown(['alpha', '--kill'], {
+      ...tmux.env,
+      AGENT_CHAT_API: listener.baseUrl,
+      AGENT_CHAT_RUNTIME_DIR: context.runtimeDir,
+      AGENT_DOWN_ACTIVITY_FRESH_MS: '120000',
+      AGENT_DOWN_LOCAL_IDLE_PROBE_MS: '0',
+      TMUX_FAKE_CAPTURE_TEXT: 'line one',
+      TMUX_FAKE_CAPTURE_TEXT_SECOND: 'line two',
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('changed during stale-status verification');
+    const log = readFakeTmuxLog(tmux.logPath);
+    expect(log).toContain('has-session');
+    expect(log).toContain('capture-pane');
     expect(log).not.toContain('kill-session');
   });
 

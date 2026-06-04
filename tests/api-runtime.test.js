@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import request from 'supertest';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'fs';
 import path from 'path';
@@ -43,6 +43,7 @@ describe('backend runtime API', () => {
   let context = null;
 
   afterEach(() => {
+    vi.useRealTimers();
     context?.cleanup();
     context = null;
   });
@@ -123,6 +124,75 @@ describe('backend runtime API', () => {
 
     const agent = await request(context.app).get('/api/agents/alpha').expect(200);
     expect(agent.body.runtimeObservation).toEqual(response.body.runtime.observation);
+  });
+
+  test('local activity sweep keeps stable busy panes active and refreshes observation provenance', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    context = await createBackendTestContext('agent-chat-local-activity-busy-test-', {
+      agents: {
+        alpha: {
+          name: 'alpha',
+          type: 'codex',
+          kind: 'agent',
+          online: true,
+          manualDown: false,
+          tmux: 'alpha:0.0',
+          server: 'local',
+        },
+      },
+      agentRuntime: {
+        alpha: {
+          activeNow: false,
+          idleDurationSec: 120,
+          observation: {
+            observerSource: 'mcp-heartbeat',
+            observerServer: 'local',
+            observedAt: Date.now() - 120_000,
+          },
+        },
+      },
+      groups: {},
+    });
+
+    let paneText = 'Working (12m 04s - esc to interrupt)';
+    context.internals.setExecFileAsyncForTest(async (cmd, args) => {
+      if (cmd === 'tmux' && args[0] === 'list-panes') {
+        return { stdout: '/dev/pts/1\talpha\t123\tcodex\t/tmp/alpha\n' };
+      }
+      if (cmd === 'tmux' && args[0] === 'capture-pane') {
+        return { stdout: paneText };
+      }
+      if (cmd === 'pgrep') return { stdout: '' };
+      throw new Error(`unexpected exec: ${cmd} ${args.join(' ')}`);
+    });
+
+    await context.internals.sweepLocalActivityDurationsForTest();
+    vi.setSystemTime(new Date('2026-01-01T00:02:00Z'));
+    await context.internals.sweepLocalActivityDurationsForTest();
+
+    let runtime = readJson(path.join(context.runtimeDir, 'data', 'agent_runtime.json'));
+    expect(runtime.alpha.activeNow).toBe(true);
+    expect(runtime.alpha.idleDurationSec).toBe(0);
+    expect(runtime.alpha.observation).toMatchObject({
+      observerSource: 'local-sweep',
+      observerServer: 'local',
+      observedAt: Date.parse('2026-01-01T00:02:00Z'),
+    });
+
+    paneText = '> ready for the next task';
+    await context.internals.sweepLocalActivityDurationsForTest();
+    vi.setSystemTime(new Date('2026-01-01T00:02:25Z'));
+    await context.internals.sweepLocalActivityDurationsForTest();
+
+    runtime = readJson(path.join(context.runtimeDir, 'data', 'agent_runtime.json'));
+    expect(runtime.alpha.activeNow).toBe(false);
+    expect(runtime.alpha.idleDurationSec).toBeGreaterThanOrEqual(5);
+    expect(runtime.alpha.observation).toMatchObject({
+      observerSource: 'local-sweep',
+      observerServer: 'local',
+      observedAt: Date.parse('2026-01-01T00:02:25Z'),
+    });
   });
 
   test('MCP heartbeat restores liveness without clearing blocked runtime state', async () => {

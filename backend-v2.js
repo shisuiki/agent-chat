@@ -57,6 +57,7 @@ import { assertRuntimeDir, isLocalAgentServer, resolveLocalServerId } from './li
 import { enforceStartupConfig } from './lib/startup-config.js';
 import { NotificationRouter } from './lib/notification-router.js';
 import { readV1AgentManifest, defaultAgentchatHomeDir, allAgentHomeRoots } from './lib/agent-home-v1.js';
+import { detectPaneBusyState } from './lib/pane-activity.js';
 import {
   buildUpstreamClaudeSubconsciousPaths,
   bootstrapUpstreamClaudeSubconsciousAgent,
@@ -91,6 +92,7 @@ const WEB_BRIDGE_FETCH_TIMEOUT_MS = Number.isFinite(WEB_BRIDGE_FETCH_TIMEOUT_MS_
   ? WEB_BRIDGE_FETCH_TIMEOUT_MS_RAW
   : 5000;
 const execFileAsync = promisify(execFile);
+let execFileAsyncImpl = execFileAsync;
 const LOCALHOST_IPS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 const LOCAL_SERVER_ID = resolveLocalServerId();
 const RECORD_LOCAL_SERVER = normalizeBoolean(process.env.AGENT_CHAT_RECORD_LOCAL_SERVER) === true;
@@ -5767,13 +5769,13 @@ async function injectSlashClear(tmuxTarget) {
   if (!tmuxTarget) return false;
   try {
     const opts = { timeout: 5000 };
-    await execFileAsync('tmux', ['send-keys', '-t', String(tmuxTarget), 'C-c'], opts);
+    await execFileAsyncImpl('tmux', ['send-keys', '-t', String(tmuxTarget), 'C-c'], opts);
     await new Promise(r => setTimeout(r, 300));
-    await execFileAsync('tmux', ['send-keys', '-t', String(tmuxTarget), 'C-u'], opts);
+    await execFileAsyncImpl('tmux', ['send-keys', '-t', String(tmuxTarget), 'C-u'], opts);
     await new Promise(r => setTimeout(r, 300));
-    await execFileAsync('tmux', ['send-keys', '-l', '-t', String(tmuxTarget), '/clear'], opts);
+    await execFileAsyncImpl('tmux', ['send-keys', '-l', '-t', String(tmuxTarget), '/clear'], opts);
     await new Promise(r => setTimeout(r, 300));
-    await execFileAsync('tmux', ['send-keys', '-t', String(tmuxTarget), 'Enter'], opts);
+    await execFileAsyncImpl('tmux', ['send-keys', '-t', String(tmuxTarget), 'Enter'], opts);
     return true;
   } catch (e) {
     console.error(`[backend] auto-clear inject failed for ${tmuxTarget}: ${e.message}`);
@@ -5784,7 +5786,7 @@ async function injectSlashClear(tmuxTarget) {
 async function captureLocalPaneContentAsync(tmuxTarget) {
   if (!tmuxTarget) return null;
   try {
-    const { stdout } = await execFileAsync('tmux', ['capture-pane', '-p', '-t', String(tmuxTarget)], {
+    const { stdout } = await execFileAsyncImpl('tmux', ['capture-pane', '-p', '-t', String(tmuxTarget)], {
       timeout: 3000,
       encoding: 'utf-8',
     });
@@ -5801,7 +5803,7 @@ async function buildLocalPaneMetadataSnapshotAsync() {
   const sessions = new Map();
   const ttyToSession = new Map();
   try {
-    const { stdout } = await execFileAsync(
+    const { stdout } = await execFileAsyncImpl(
       'tmux',
       ['list-panes', '-a', '-F', '#{pane_tty}\t#{session_name}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}'],
       { encoding: 'utf-8', timeout: 3000 }
@@ -6098,6 +6100,7 @@ async function sweepLocalActivityDurations() {
     }
 
     const paneHash = paneCapture.hash;
+    const paneBusy = detectPaneBusyState(paneCapture.text).busy;
     const blockedReason = detectLocalBlockedReason(paneCapture.text, paneCmd);
     const blocked = Boolean(blockedReason);
     applyLocalRuntimeSignals(agent.name, {
@@ -6162,17 +6165,24 @@ async function sweepLocalActivityDurations() {
       st.lastChangeSec = nowSec;
     }
 
+    if (paneBusy) st.burstLastSec = nowSec;
+
     const rawIdleSec = Math.max(0, nowSec - st.lastChangeSec);
-    const activeNow = rawIdleSec < IDLE_THRESHOLD_SEC;
+    const activeNow = paneBusy || rawIdleSec < IDLE_THRESHOLD_SEC;
     const activeDurationSec = activeNow ? Math.max(0, nowSec - st.burstStartSec) : 0;
     const idleDurationSec = activeNow ? 0 : Math.max(0, rawIdleSec - IDLE_THRESHOLD_SEC);
 
-    const changed = setRuntimeActivityFields(runtime, {
+    let changed = setRuntimeActivityFields(runtime, {
       activeNow,
       activeDurationSec,
       idleDurationSec,
       lastTmuxActivitySec: st.lastChangeSec,
     });
+    if (setRuntimeObservation(runtime, {
+      observerSource: 'local-sweep',
+      observerServer: 'local',
+      observedAt: nowMs,
+    })) changed = true;
     if (changed) {
       runtime.updatedAt = Date.now();
       runtimeChanged = true;
@@ -6332,7 +6342,7 @@ async function readAgentScopeMemory(agentName, panePidMap = null) {
     const env = USER_RUNTIME_DIR && USER_DBUS_SESSION_BUS
       ? { ...process.env, XDG_RUNTIME_DIR: USER_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS: USER_DBUS_SESSION_BUS }
       : process.env;
-    const { stdout: out } = await execFileAsync(
+    const { stdout: out } = await execFileAsyncImpl(
       'systemctl',
       ['--user', 'show', unit, '--property=ActiveState', '--property=MemoryCurrent', '--property=MemoryHigh', '--value', '--no-pager'],
       { encoding: 'utf-8', timeout: 3000, env }
@@ -6718,7 +6728,7 @@ async function collectLocalMcpSessionsAsync(paneMetadataSnapshot = null) {
     if (!ptsMap.size) return new Set();
     let pids;
     try {
-      const { stdout } = await execFileAsync('pgrep', ['-f', 'node.*mcp-server.js'], { timeout: 3000, encoding: 'utf-8' });
+      const { stdout } = await execFileAsyncImpl('pgrep', ['-f', 'node.*mcp-server.js'], { timeout: 3000, encoding: 'utf-8' });
       pids = stdout.trim().split('\n').filter(Boolean);
     } catch {
       return new Set();
@@ -6726,7 +6736,7 @@ async function collectLocalMcpSessionsAsync(paneMetadataSnapshot = null) {
     if (!pids.length) return new Set();
     const matched = new Set();
     try {
-      const { stdout } = await execFileAsync('ps', ['-o', 'pid=,tty=', '-p', pids.join(',')], {
+      const { stdout } = await execFileAsyncImpl('ps', ['-o', 'pid=,tty=', '-p', pids.join(',')], {
         timeout: 3000,
         encoding: 'utf-8',
       });
@@ -6769,7 +6779,7 @@ async function localTmuxSessionExistsAsync(sessionName) {
   const sess = String(sessionName || '').trim();
   if (!sess) return false;
   try {
-    await execFileAsync('tmux', ['has-session', '-t', sess], { timeout: 2000 });
+    await execFileAsyncImpl('tmux', ['has-session', '-t', sess], { timeout: 2000 });
     return true;
   } catch {
     return false;
@@ -10672,6 +10682,13 @@ export const __backendV2TestInternals = {
   notifyAgentCatchupForTest: notifyAgentCatchup,
   pushNotifyForTest: pushNotify,
   sseAdapterForTest: sseAdapter,
+  sweepLocalActivityDurationsForTest: sweepLocalActivityDurations,
+  setExecFileAsyncForTest(fn) {
+    execFileAsyncImpl = typeof fn === 'function' ? fn : execFileAsync;
+  },
+  resetExecFileAsyncForTest() {
+    execFileAsyncImpl = execFileAsync;
+  },
   safeWriteJsonFile,
   setJsonSaveFailureForTest,
 };

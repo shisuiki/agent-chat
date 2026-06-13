@@ -630,6 +630,66 @@ describe('backend message API', () => {
     }
   });
 
+  test('backend push queue defaults to loopback even when public web url is configured', async () => {
+    const queueStub = await createQueueStub((_req, count) => ({
+      status: 200,
+      body: { ok: true, id: count, queuedAt: 4000 + count },
+    }));
+    const queuePort = new URL(queueStub.url).port;
+    const retryContext = await createBackendTestContext('agent-chat-loopback-queue-test-', {
+      agents: {
+        alpha: {
+          name: 'alpha',
+          type: 'agent',
+          kind: 'agent',
+          online: true,
+          tmux: 'alpha:0.0',
+          server: 'local',
+        },
+      },
+      groups: {},
+      messages: [
+        {
+          id: 'msg_public_web_url',
+          ts: 1000,
+          from: 'operator',
+          to: 'alpha',
+          type: 'human',
+          summary: 'public web url should not own queue',
+          full: 'public web url should not own queue',
+          mentions: [],
+          trustLevel: 'operator',
+        },
+      ],
+      env: {
+        AGENT_CHAT_WEB_URL: 'https://agent.example.test',
+        AGENT_CHAT_WEB_PORT: queuePort,
+      },
+    });
+
+    try {
+      const result = await retryContext.internals.pushNotifyForTest('alpha', {
+        id: 'msg_public_web_url',
+        ts: 1000,
+        from: 'operator',
+        to: 'alpha',
+        type: 'human',
+        priority: 'normal',
+        summary: 'public web url should not own queue',
+      });
+
+      expect(result).toMatchObject({ queued: true });
+      expect(queueStub.requests).toHaveLength(1);
+      expect(queueStub.requests[0]).toMatchObject({
+        method: 'POST',
+        url: '/api/queue',
+      });
+    } finally {
+      retryContext.cleanup();
+      await queueStub.close();
+    }
+  });
+
   test('backend queues hostname-local agents when backend env still uses legacy local', async () => {
     const queueStub = await createQueueStub((_req, count) => ({
       status: 200,

@@ -240,6 +240,36 @@ describe('server heartbeat api', () => {
     expect(agents['agent-b'].tmux).toBe(null);
   });
 
+  test('heartbeat does not resurrect a manually down remote agent', async () => {
+    context = await createBackendTestContext('api-server-heartbeat-test-', baseSeed({
+      agents: {
+        'paused-remote': makeAgent('paused-remote', {
+          online: false,
+          server: 'remote-host-1',
+          manualDown: true,
+          offlineReason: 'agent-down-kill',
+          tmux: null,
+        }),
+      },
+    }));
+
+    const response = await postHeartbeat(context.app, {
+      server: 'remote-host-1',
+      agents: ['paused-remote'],
+      sessions: ['paused-remote:0.0'],
+      instanceId: 'inst-1',
+      bootTs: 1000,
+    });
+    const agent = await request(context.app).get('/api/agents/paused-remote').expect(200);
+
+    expect(response.status).toBe(200);
+    expect(agent.body.online).toBe(false);
+    expect(agent.body.manualDown).toBe(true);
+    expect(agent.body.state).toBe('manual_down');
+    expect(agent.body.tmux).toBe(null);
+    expect(agent.body.offlineReason).toBe('agent-down-kill');
+  });
+
   test('accepts repeated heartbeats from the same instance lease', async () => {
     context = await createBackendTestContext('api-server-heartbeat-test-', baseSeed());
 

@@ -6674,13 +6674,23 @@ function applyServerHeartbeat(serverId, payload = {}, sourceIp = null) {
       agentsChanged = true;
     }
     if (normalizeServer(agent.server) !== serverId) { agent.server = serverId; agentsChanged = true; }
-    if (!agent.tmux) { agent.tmux = `${name}:0.0`; agentsChanged = true; }
     const wasAgentOnline = agent.online === true;
+    const wasManualDown = agent.manualDown === true;
+    if (wasManualDown) {
+      // Operator/manual shutdown is authoritative. A remote relay heartbeat only
+      // proves the host can still observe a session; it must not resurrect it.
+      syncAgentMachine(name, { manualDown: true });
+      if (agent.online !== false || agent.manualDown !== true) agentsChanged = true;
+      if (agent.tmux !== null) { agent.tmux = null; agentsChanged = true; }
+      if (!agent.offlineReason) { agent.offlineReason = 'manual-down'; agentsChanged = true; }
+      if (agent.lastSeen !== now) { agent.lastSeen = now; agentsChanged = true; }
+      continue;
+    }
+    if (!agent.tmux) { agent.tmux = `${name}:0.0`; agentsChanged = true; }
     const runtime = ensureAgentRuntimeRecord(name);
     // Drive online/manualDown through machine
     syncAgentMachine(name, {
       heartbeatPresent: true,
-      manualDown: false,
       mcpPresent: runtime?.mcpPresent === true ? true : (runtime?.mcpPresent === false ? false : undefined),
     });
     if (!wasAgentOnline && agent.online) becameOnline.push(name);

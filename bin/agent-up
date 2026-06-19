@@ -10,7 +10,7 @@ fi
 # agent-up — Quick agent launcher with resume support
 #
 # Usage:
-#   agent-up <name> [path] [claude|codex] [--fresh] [--attach] [--allow-shared-workspace] [--model <model>] [--extra-args "<args>"]
+#   agent-up <name> [path] [claude|codex] [--fresh] [--resume-id <uuid>] [--attach] [--allow-shared-workspace] [--model <model>] [--extra-args "<args>"]
 #
 # If path is omitted, reads from saved meta.json (previous agent-down).
 # If --fresh is not set, resume-id is required for strict resume (no silent fallback).
@@ -83,12 +83,13 @@ AUTH_HEADER=""
 
 usage() {
   cat <<'USAGE'
-Usage: agent-up <name> [path] [claude|codex] [--fresh] [--attach] [--allow-shared-workspace] [--model <model>] [--extra-args "<args>"]
+Usage: agent-up <name> [path] [claude|codex] [--fresh] [--resume-id <uuid>] [--attach] [--allow-shared-workspace] [--model <model>] [--extra-args "<args>"]
 
   name         tmux session name / agent name
   path         working directory (optional if previously saved)
   type         claude (default) or codex
   --fresh      ignore saved resume ID, start a new session
+  --resume-id  explicit session UUID to resume for a new backend identity
   --attach     attach to the session after creating it
   --allow-shared-workspace allow launching when another agent already uses the same path
   --model      model name passed to claude/codex at startup
@@ -135,6 +136,70 @@ if isinstance(obj, dict) and not obj.get("error"):
     if name and name.lower() == raw.lower():
         print(name)
 PY
+}
+
+backend_agent_table_status() {
+  local raw="$1"
+  local encoded url body_file http_code status
+  encoded="$(url_encode "$raw")"
+  url="$BACKEND_URL/api/agents/$encoded"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/agent-up-agent.XXXXXX")"
+  if [ -n "$AUTH_HEADER" ]; then
+    http_code="$(curl --noproxy '*' -sS -o "$body_file" -w '%{http_code}' -H "$AUTH_HEADER" "$url" 2>/dev/null || true)"
+  else
+    http_code="$(curl --noproxy '*' -sS -o "$body_file" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  fi
+  case "$http_code" in
+    200)
+      status="$(
+        BACKEND_BODY_FILE="$body_file" python3 - <<'PY' 2>/dev/null || echo unknown
+import json
+import os
+
+try:
+    with open(os.environ["BACKEND_BODY_FILE"], encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    print("unknown")
+    raise SystemExit(0)
+
+if isinstance(data, dict) and not data.get("error") and str(data.get("name") or "").strip():
+    print("exists")
+else:
+    print("missing")
+PY
+      )"
+      ;;
+    404)
+      status="missing"
+      ;;
+    *)
+      status="unknown"
+      ;;
+  esac
+  rm -f "$body_file"
+  echo "${status:-unknown}"
+}
+
+require_backend_name_absent_for_explicit_resume() {
+  local name="$1"
+  local status
+  status="$(backend_agent_table_status "$name")"
+  case "$status" in
+    missing)
+      return 0
+      ;;
+    exists)
+      echo "Error: --resume-id is only allowed when '$name' is absent from the backend agent table." >&2
+      echo "Refusing to overwrite an existing backend identity's resume state." >&2
+      exit 1
+      ;;
+    *)
+      echo "Error: cannot verify backend agent table for '$name' before using --resume-id." >&2
+      echo "Refusing explicit resume-id import without proving the name is unused." >&2
+      exit 1
+      ;;
+  esac
 }
 
 resolve_agent_name_tmux() {
@@ -431,12 +496,21 @@ AGENT_PATH=""
 TYPE=""
 MODEL=""
 EXTRA_ARGS=""
+EXPLICIT_RESUME_ID=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --fresh)
       FRESH=true
       shift
+      ;;
+    --resume-id)
+      if [ $# -lt 2 ]; then
+        echo "Error: --resume-id requires a value" >&2
+        exit 1
+      fi
+      EXPLICIT_RESUME_ID="$2"
+      shift 2
       ;;
     --attach)
       ATTACH=true
@@ -478,6 +552,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ -n "$EXPLICIT_RESUME_ID" ]; then
+  if [ "$FRESH" = true ]; then
+    echo "Error: --resume-id cannot be combined with --fresh." >&2
+    exit 1
+  fi
+  if ! [[ "$EXPLICIT_RESUME_ID" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]; then
+    echo "Error: --resume-id must be a lowercase UUID, got '$EXPLICIT_RESUME_ID'." >&2
+    exit 1
+  fi
+  require_backend_name_absent_for_explicit_resume "$NAME"
+fi
+
 # ── Load saved meta ──────────────────────────────────────────────────
 AGENT_DATA="$DATA_DIR/$NAME"
 META_FILE="$AGENT_DATA/meta.json"
@@ -486,11 +572,11 @@ TMP_RUNTIME_DIR="$AGENT_DATA/tmp"
 
 # Auto-detect first-time agent: no meta AND no resume-id => fresh start.
 # If resume-id already exists (e.g. recovered via agent-down), keep resume path.
-if [ ! -f "$META_FILE" ] && [ "$FRESH" = false ] && [ ! -f "$RESUME_FILE" ]; then
+if [ -z "$EXPLICIT_RESUME_ID" ] && [ ! -f "$META_FILE" ] && [ "$FRESH" = false ] && [ ! -f "$RESUME_FILE" ]; then
   FRESH=true
 # v1 agent: up-v1 pre-creates meta.json + dangling resume-id symlink before first launch.
 # Detect this case: symlink exists but target is missing → treat as fresh.
-elif [ "$FRESH" = false ] && [ ! -f "$RESUME_FILE" ] && [ -L "$RESUME_FILE" ]; then
+elif [ -z "$EXPLICIT_RESUME_ID" ] && [ "$FRESH" = false ] && [ ! -f "$RESUME_FILE" ] && [ -L "$RESUME_FILE" ]; then
   FRESH=true
 fi
 
@@ -1286,7 +1372,12 @@ capture_guard_matches() {
   [ "$token_now" = "$CAPTURE_GUARD_TOKEN" ]
 }
 
-SESSION_ID="$SAVED_SESSION_ID"
+if [ -n "$EXPLICIT_RESUME_ID" ]; then
+  mkdir -p "$AGENT_DATA"
+  echo "$EXPLICIT_RESUME_ID" > "$RESUME_FILE"
+fi
+
+SESSION_ID="${EXPLICIT_RESUME_ID:-$SAVED_SESSION_ID}"
 if [ "$TYPE" = "claude" ]; then
   if [ "$FRESH" = true ]; then
     SESSION_ID=$(generate_uuid)

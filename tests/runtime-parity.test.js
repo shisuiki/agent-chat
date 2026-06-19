@@ -30,6 +30,23 @@ describe('runtime parity regressions', () => {
     }
   });
 
+  test('agent-up explicit resume-id contract is mirrored', () => {
+    for (const scriptPath of ['bin/agent-up', 'remote/bin/agent-up']) {
+      const source = readFileSync(path.resolve(scriptPath), 'utf-8');
+      expect(source).toContain('--resume-id  explicit session UUID to resume for a new backend identity');
+      expect(source).toContain('EXPLICIT_RESUME_ID=""');
+      expect(source).toContain('require_backend_name_absent_for_explicit_resume "$NAME"');
+      expect(source).toContain('Error: --resume-id cannot be combined with --fresh.');
+      expect(source).toContain('SESSION_ID="${EXPLICIT_RESUME_ID:-$SAVED_SESSION_ID}"');
+    }
+
+    const upV1Source = readFileSync(path.resolve('bin/agent-up-v1'), 'utf-8');
+    expect(upV1Source).toContain('--fresh --resume-id <uuid>');
+    expect(upV1Source).toContain('EXPLICIT_RESUME_ID="$2"');
+    expect(upV1Source).toContain('PASS_ARGS+=("$1" "$2")');
+    expect(upV1Source).toContain('require_backend_name_absent_for_explicit_resume "$NAME"');
+  });
+
   test('deployment and upstream helpers avoid machine-specific hardcoded home paths', async () => {
     const autodeploySource = readFileSync(path.resolve('scripts/agentchat-stable-autodeploy.sh'), 'utf-8');
     const autostartSource = readFileSync(path.resolve('bin/agentchat-autostart.sh'), 'utf-8');

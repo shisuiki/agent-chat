@@ -43,6 +43,7 @@ The first phase is documentation and audit only. Code repairs start after the re
 | `19-unified-delivery-architecture.md` | Long-term unified delivery-task architecture for visible notification ownership. |
 | `20-runtime-node-distribution-audit.md` | Multi-agent audit replacing remote/local product concepts with runtime-node, capability, and artifact/install-profile contracts. |
 | `21-matrix-federation-bridge-audit.md` | Osaka Matrix federation, Palpo room-join failure, and Matrix bridge hidden-risk audit. |
+| `22-agent-up-env-usage-audit.md` | Evidence table for generated `agent-up` env vars: required, conditional, redundant, and generated-but-unused. |
 | `system-map.md` | Repository map, runtime components, major flows, and source-of-truth boundaries. |
 | `kernel-boundaries.md` | Core/adjacent/edge classification and ownership rules. |
 | `audit-findings.md` | Consolidated structural and code audit findings with evidence. |

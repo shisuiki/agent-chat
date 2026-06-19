@@ -26,6 +26,14 @@
       "unsupportedSmoke": ["definitely-not-a-command"],
       "helpAssertions": [
         {
+          "command": "up",
+          "mustContain": ["--resume-id", "explicit session UUID to resume for a new backend identity"]
+        },
+        {
+          "command": "up-v1",
+          "mustContain": ["--resume-id <uuid>", "options passed to agent-up"]
+        },
+        {
           "command": "service",
           "mustContain": ["Controls services on the current host only.", "remote relay service agent-chat-push-relay"]
         },
@@ -69,6 +77,10 @@
         "check-mcp"
       ],
       "helpAssertions": [
+        {
+          "command": "up",
+          "mustContain": ["--resume-id", "explicit session UUID to resume for a new backend identity"]
+        },
         {
           "command": "service",
           "mustContain": ["Controls services on the current host only.", "remote relay service agent-chat-push-relay"]

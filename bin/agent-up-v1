@@ -36,8 +36,82 @@ v1 provisioning options:
   --agent-id <id>            Explicit internal id (default: agent_<normalized-name>)
 
 Pass-through options (handled by agent-up):
-  --fresh --attach --allow-shared-workspace --model <m> --extra-args "<args>"
+  --fresh --resume-id <uuid> --attach --allow-shared-workspace --model <m> --extra-args "<args>"
 USAGE
+}
+
+url_encode() {
+  python3 - "$1" <<'PY'
+import sys
+import urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=""))
+PY
+}
+
+backend_agent_table_status() {
+  local raw="$1"
+  local backend_port backend_url encoded url body_file http_code status
+  backend_port="${AGENT_CHAT_BACKEND_PORT:-8090}"
+  backend_url="${AGENT_CHAT_API:-http://127.0.0.1:$backend_port}"
+  encoded="$(url_encode "$raw")"
+  url="$backend_url/api/agents/$encoded"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/agent-up-v1-agent.XXXXXX")"
+  if [ -n "${API_TOKEN:-}" ]; then
+    http_code="$(curl --noproxy '*' -sS -o "$body_file" -w '%{http_code}' -H "Authorization: Bearer $API_TOKEN" "$url" 2>/dev/null || true)"
+  else
+    http_code="$(curl --noproxy '*' -sS -o "$body_file" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  fi
+  case "$http_code" in
+    200)
+      status="$(
+        BACKEND_BODY_FILE="$body_file" python3 - <<'PY' 2>/dev/null || echo unknown
+import json
+import os
+
+try:
+    with open(os.environ["BACKEND_BODY_FILE"], encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    print("unknown")
+    raise SystemExit(0)
+
+if isinstance(data, dict) and not data.get("error") and str(data.get("name") or "").strip():
+    print("exists")
+else:
+    print("missing")
+PY
+      )"
+      ;;
+    404)
+      status="missing"
+      ;;
+    *)
+      status="unknown"
+      ;;
+  esac
+  rm -f "$body_file"
+  echo "${status:-unknown}"
+}
+
+require_backend_name_absent_for_explicit_resume() {
+  local name="$1"
+  local status
+  status="$(backend_agent_table_status "$name")"
+  case "$status" in
+    missing)
+      return 0
+      ;;
+    exists)
+      echo "Error: --resume-id is only allowed when '$name' is absent from the backend agent table." >&2
+      echo "Refusing to overwrite an existing backend identity's resume state." >&2
+      exit 1
+      ;;
+    *)
+      echo "Error: cannot verify backend agent table for '$name' before using --resume-id." >&2
+      echo "Refusing explicit resume-id import without proving the name is unused." >&2
+      exit 1
+      ;;
+  esac
 }
 
 if [ $# -lt 1 ]; then
@@ -64,6 +138,8 @@ PROJECT_MODE="copy"
 PROJECT_NAME=""
 HOME_OVERRIDE=""
 AGENT_ID_OVERRIDE=""
+FRESH_REQUESTED=0
+EXPLICIT_RESUME_ID=""
 declare -a PASS_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -103,7 +179,18 @@ while [ $# -gt 0 ]; do
       PASS_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --fresh|--attach|--allow-shared-workspace)
+    --resume-id)
+      [ $# -ge 2 ] || { echo "Error: --resume-id requires a value" >&2; exit 1; }
+      EXPLICIT_RESUME_ID="$2"
+      PASS_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --fresh)
+      FRESH_REQUESTED=1
+      PASS_ARGS+=("$1")
+      shift
+      ;;
+    --attach|--allow-shared-workspace)
       PASS_ARGS+=("$1")
       shift
       ;;
@@ -118,6 +205,18 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -n "$EXPLICIT_RESUME_ID" ]; then
+  if [ "$FRESH_REQUESTED" = "1" ]; then
+    echo "Error: --resume-id cannot be combined with --fresh." >&2
+    exit 1
+  fi
+  if ! [[ "$EXPLICIT_RESUME_ID" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]; then
+    echo "Error: --resume-id must be a lowercase UUID, got '$EXPLICIT_RESUME_ID'." >&2
+    exit 1
+  fi
+  require_backend_name_absent_for_explicit_resume "$NAME"
+fi
 
 if [ ! -f "$PROVISION_SCRIPT" ]; then
   echo "Error: missing provision script: $PROVISION_SCRIPT" >&2

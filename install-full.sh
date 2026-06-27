@@ -291,7 +291,6 @@ configure_claude_mcp() {
     -e "AGENT_CHAT_API=$api_base" \
     -e "API_TOKEN=$api_token" \
     -e "AGENTCHAT_HOMEDIR=$agentchat_home" \
-    -e "AGENT_CHAT_MCP_SERVER_NAME=agent-chat" \
     -- agent-chat node "$INSTALL_DIR/mcp-server.js"
 }
 
@@ -315,7 +314,6 @@ configure_codex_mcp() {
     --env "AGENT_CHAT_API=$api_base" \
     --env "API_TOKEN=$api_token" \
     --env "AGENTCHAT_HOMEDIR=$agentchat_home" \
-    --env "AGENT_CHAT_MCP_SERVER_NAME=agent-chat" \
     -- node "$INSTALL_DIR/mcp-server.js"
 }
 

@@ -107,6 +107,7 @@ describe('local install and uninstall scripts', () => {
       expect(claudeArgs).toContain('AGENT_CHAT_API=http://127.0.0.1:8090');
       expect(claudeArgs).toContain('API_TOKEN=test-install-token');
       expect(claudeArgs).toContain(`AGENTCHAT_HOMEDIR=${home}/.agentchat`);
+      expect(claudeArgs).not.toContain('AGENT_CHAT_MCP_SERVER_NAME');
       expect(claudeArgs).toContain(`agent-chat node ${ROOT}/mcp-server.js`);
 
       const codexArgs = readFileSync(codexLogPath, 'utf-8');
@@ -115,6 +116,7 @@ describe('local install and uninstall scripts', () => {
       expect(codexArgs).toContain('AGENT_CHAT_API=http://127.0.0.1:8090');
       expect(codexArgs).toContain('API_TOKEN=test-install-token');
       expect(codexArgs).toContain(`AGENTCHAT_HOMEDIR=${home}/.agentchat`);
+      expect(codexArgs).not.toContain('AGENT_CHAT_MCP_SERVER_NAME');
       expect(codexArgs).toContain(`node ${ROOT}/mcp-server.js`);
     } finally {
       rmSync(tmp, { recursive: true, force: true });

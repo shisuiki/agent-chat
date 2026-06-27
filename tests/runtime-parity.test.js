@@ -22,11 +22,34 @@ describe('runtime parity regressions', () => {
       expect(source).toContain('mcp_servers.${CODEX_MCP_NAME}.args');
       expect(source).toContain('codex_mcp_env API_TOKEN "${API_TOKEN:-}"');
       expect(source).toContain('codex_mcp_env AGENTCHAT_HOMEDIR "${AGENTCHAT_HOMEDIR:-}"');
+      expect(source).not.toContain('codex_mcp_env AGENT_CHAT_BACKEND_PORT "$BACKEND_PORT"');
+      expect(source).not.toContain('codex_mcp_env AGENT_CHAT_MCP_SERVER_NAME "$MCP_SERVER_NAME"');
+      expect(source).not.toContain('env["AGENT_CHAT_BACKEND_PORT"]');
+      expect(source).not.toContain('env["AGENT_CHAT_MCP_SERVER_NAME"]');
       expect(source).toContain('tmux send-keys -t "$TMUX_PANE_TARGET" "$(shell_quote "$CODEX_LAUNCH_SCRIPT")" Enter');
       expect(source).toContain('CODEX_INIT_FILE=$(mktemp "$TMP_RUNTIME_DIR/init-codex.XXXXXX")');
       expect(source).toContain('codex $CODEX_FLAGS -C $(shell_quote "$AGENT_PATH") --');
       expect(source).not.toContain('tmux send-keys -t "$TMUX_PANE_TARGET" -l "$INIT_PROMPT"');
       expect(source).not.toContain('Launch cmd:');
+    }
+  });
+
+  test('agent-up launch env exports only verified generated contracts', () => {
+    for (const scriptPath of ['bin/agent-up', 'remote/bin/agent-up']) {
+      const source = readFileSync(path.resolve(scriptPath), 'utf-8');
+      expect(source).toContain('write_launch_env "AGENT_NAME" "$NAME"');
+      expect(source).toContain('write_launch_env "AGENT_CHAT_API" "$BACKEND_URL"');
+      expect(source).toContain('write_launch_env_from_env "API_TOKEN"');
+      expect(source).toContain('write_launch_env "AGENT_CHAT_SERVER" "$SERVER_ID"');
+      expect(source).toContain('write_launch_env "AGENTCHAT_AGENT_STATE_DIR" "$SAVED_STATE_DIR"');
+      expect(source).not.toContain('Bulk-export all AGENT_CHAT_* vars');
+      expect(source).not.toContain('awk \'index($0, "AGENT_CHAT_") == 1\'');
+      expect(source).not.toContain('write_launch_env "AGENTCHAT_RUNTIME_PROFILE_PRIMARY_JSON"');
+      expect(source).not.toContain('write_launch_env "AGENTCHAT_RUNTIME_PROFILE_SUPERVISOR_JSON"');
+      expect(source).not.toContain('write_launch_env "AGENTCHAT_AGENT_MODEL_VERSION"');
+      expect(source).not.toContain('write_launch_env "AGENTCHAT_AGENT_HOME"');
+      expect(source).not.toContain('write_launch_env "AGENTCHAT_AGENT_WORKDIR"');
+      expect(source).not.toContain('write_launch_env "AGENTCHAT_SUBCONSCIOUS_PLUGIN_ROOT"');
     }
   });
 

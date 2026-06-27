@@ -795,9 +795,44 @@ is_valid_claude_session_id() {
   [ -n "$sid" ] || return 1
   while IFS= read -r d; do
     [ -n "$d" ] || continue
-    [ -f "$d/$sid.jsonl" ] && return 0
+    if [ -f "$d/$sid.jsonl" ] && claude_session_file_has_conversation "$d/$sid.jsonl"; then
+      return 0
+    fi
   done < <(claude_project_dirs_for_path "$p")
   return 1
+}
+
+claude_session_file_has_conversation() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  python3 - "$file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    handle = open(path, encoding="utf-8", errors="replace")
+except OSError:
+    raise SystemExit(1)
+
+with handle:
+    for idx, line in enumerate(handle):
+        if idx >= 1000:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") in {"user", "assistant"}:
+            raise SystemExit(0)
+        msg = obj.get("message")
+        if isinstance(msg, dict) and msg.get("role") in {"user", "assistant"}:
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 is_valid_uuid() {
@@ -1434,13 +1469,9 @@ if [ "$TYPE" = "claude" ] && [ "$FRESH" = false ]; then
   fi
   RID_CHECK=$(cat "$RESUME_FILE" 2>/dev/null || true)
   if ! is_valid_claude_session_id "$AGENT_PATH" "$RID_CHECK"; then
-    if is_valid_uuid "$RID_CHECK" && [ "$RID_CHECK" = "$SESSION_ID" ]; then
-      echo "Warning: local Claude session file not found yet; attempting resume with explicit session-id $RID_CHECK."
-    else
-      echo "Error: resume-id '$RID_CHECK' is not a valid local Claude session file." >&2
-      echo "Manual check required: inspect archive tail and fix $RESUME_FILE." >&2
-      exit 1
-    fi
+    echo "Error: resume-id '$RID_CHECK' is not a valid local Claude session file." >&2
+    echo "Manual check required: inspect archive tail and fix $RESUME_FILE." >&2
+    exit 1
   fi
 fi
 

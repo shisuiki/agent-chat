@@ -257,6 +257,18 @@ function seedClaudeSession(homeDir, workdir, sessionId, agentName) {
   return filePath;
 }
 
+function seedClaudeMetadataOnlySession(homeDir, workdir, sessionId) {
+  const projectDir = path.join(homeDir, '.claude', 'projects', claudeProjectSegment(workdir));
+  mkdirSync(projectDir, { recursive: true });
+  const filePath = path.join(projectDir, `${sessionId}.jsonl`);
+  writeFileSync(filePath, [
+    JSON.stringify({ type: 'permission-mode', permissionMode: 'bypassPermissions', sessionId }),
+    JSON.stringify({ type: 'last-prompt', sessionId }),
+    '',
+  ].join('\n'));
+  return filePath;
+}
+
 afterEach(() => {
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
   cleanupDirs.clear();
@@ -333,6 +345,28 @@ describe('agentchat up --resume-id', () => {
     expect(readFileSync(launchScript, 'utf-8')).toContain(`exec claude --resume ${sessionId}`);
     expect(readFileSync(tmuxLog, 'utf-8')).toContain('launch-claude.sh');
     expect(out).toContain(`Resuming claude session: ${sessionId}`);
+  });
+
+  test('claude resume rejects metadata-only project files without conversation turns', () => {
+    const { agentchatBin, env, runtimeDir, homeDir } = setupSandbox();
+    const agentName = 'empty-claude';
+    const sessionId = 'dddddddd-eeee-ffff-1111-222222222222';
+    const workdir = path.join(homeDir, '.agentchat', 'agents', 'agent_empty-claude', 'workdir');
+    mkdirSync(path.join(runtimeDir, 'data', 'agents', agentName), { recursive: true });
+    mkdirSync(workdir, { recursive: true });
+    seedClaudeMetadataOnlySession(homeDir, workdir, sessionId);
+    writeFileSync(path.join(runtimeDir, 'data', 'agents', agentName, 'resume-id'), `${sessionId}\n`);
+    writeFileSync(path.join(runtimeDir, 'data', 'agents', agentName, 'meta.json'), JSON.stringify({
+      name: agentName,
+      path: workdir,
+      type: 'claude',
+    }, null, 2));
+
+    const result = runCliFail(agentchatBin, ['up', agentName], env);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`resume-id '${sessionId}' is not a valid local Claude session file`);
+    expect(existsSync(path.join(runtimeDir, 'data', 'agents', agentName, 'tmp', 'launch-claude.sh'))).toBe(false);
   });
 
   test('up-v1 rejects --resume-id with --fresh before provisioning', () => {

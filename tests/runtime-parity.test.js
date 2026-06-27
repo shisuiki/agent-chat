@@ -18,6 +18,11 @@ describe('runtime parity regressions', () => {
       expect(source).toContain('write_launch_script()');
       expect(source).toContain('launch-claude.sh');
       expect(source).toContain('launch-codex.sh');
+      expect(source).toContain('auto_accept_claude_permission_prompt()');
+      expect(source).toContain("grep -q 'Enter to confirm.*Esc to cancel'");
+      expect(source).toContain("grep -q '2[.)] Not now'");
+      expect(source).toContain('tmux send-keys -t "$TMUX_PANE_TARGET" Up Enter');
+      expect(source).toContain('auto_accept_claude_permission_prompt');
       expect(source).toContain('mcp_servers.${CODEX_MCP_NAME}.command');
       expect(source).toContain('mcp_servers.${CODEX_MCP_NAME}.args');
       expect(source).toContain('codex_mcp_env API_TOKEN "${API_TOKEN:-}"');

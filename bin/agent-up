@@ -1643,6 +1643,24 @@ write_launch_script() {
   chmod 700 "$target"
 }
 
+auto_accept_claude_permission_prompt() {
+  (
+    local delay pane_text
+    for delay in 2 5 10; do
+      sleep "$delay"
+      pane_text=$(tmux capture-pane -t "$TMUX_PANE_TARGET" -p -S -80 2>/dev/null || true)
+      if printf '%s\n' "$pane_text" | grep -q 'Enter to confirm.*Esc to cancel'; then
+        if printf '%s\n' "$pane_text" | grep -q '2[.)] Not now'; then
+          tmux send-keys -t "$TMUX_PANE_TARGET" Up Enter 2>/dev/null || true
+        else
+          tmux send-keys -t "$TMUX_PANE_TARGET" Enter 2>/dev/null || true
+        fi
+        return 0
+      fi
+    done
+  ) >/dev/null 2>&1 &
+}
+
 # ── Launch env file helpers ──────────────────────────────────────────
 # Write launch env vars to a sourced file instead of an inline command
 # prefix.  Keeps the tmux launch command short and debuggable.
@@ -1860,6 +1878,7 @@ if [ "$TYPE" = "claude" ]; then
     CLAUDE_LAUNCH_SCRIPT="$TMP_RUNTIME_DIR/launch-claude.sh"
     write_launch_script "$CLAUDE_LAUNCH_SCRIPT" "exec claude --resume $(shell_quote "$RID") $CLAUDE_FLAGS"
     tmux send-keys -t "$TMUX_PANE_TARGET" "$(shell_quote "$CLAUDE_LAUNCH_SCRIPT")" Enter
+    auto_accept_claude_permission_prompt
   else
     echo "Starting new claude session..."
     # Write init prompt to temp file to avoid shell escaping issues.
@@ -1869,6 +1888,7 @@ if [ "$TYPE" = "claude" ]; then
     CLAUDE_LAUNCH_SCRIPT="$TMP_RUNTIME_DIR/launch-claude.sh"
     write_launch_script "$CLAUDE_LAUNCH_SCRIPT" "claude --session-id $(shell_quote "$SESSION_ID") $CLAUDE_FLAGS -- \"\$(cat $(shell_quote "$INIT_FILE"))\"; status=\$?; rm -f $(shell_quote "$INIT_FILE"); exit \$status"
     tmux send-keys -t "$TMUX_PANE_TARGET" "$(shell_quote "$CLAUDE_LAUNCH_SCRIPT")" Enter
+    auto_accept_claude_permission_prompt
     ( sleep 300; rm -f "$INIT_FILE" >/dev/null 2>&1 || true ) &
     capture_resume_id_background "claude"
   fi

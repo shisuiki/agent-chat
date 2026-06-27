@@ -756,18 +756,48 @@ enforce_workspace_uniqueness() {
   exit 1
 }
 
-claude_project_dir_for_path() {
+claude_project_dirs_for_path() {
   local p="$1"
   [ -n "$p" ] || return 1
-  echo "$HOME/.claude/projects/${p//\//-}"
+  HOME_DIR="$HOME" PROJECT_PATH="$p" python3 - <<'PY'
+import os
+import re
+
+home = os.environ.get("HOME_DIR", "")
+path = os.environ.get("PROJECT_PATH", "")
+if not home or not path:
+    raise SystemExit(1)
+
+roots = []
+
+def add(segment):
+    if not segment:
+        return
+    full = os.path.join(home, ".claude", "projects", segment)
+    if full not in roots:
+        roots.append(full)
+
+add(path.replace("/", "-"))
+add(re.sub(r"[^A-Za-z0-9-]", "-", path))
+
+for root in roots:
+    print(root)
+PY
+}
+
+claude_project_dir_for_path() {
+  claude_project_dirs_for_path "$1" | head -1
 }
 
 is_valid_claude_session_id() {
   local p="$1" sid="$2"
   local d
   [ -n "$sid" ] || return 1
-  d=$(claude_project_dir_for_path "$p") || return 1
-  [ -f "$d/$sid.jsonl" ]
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    [ -f "$d/$sid.jsonl" ] && return 0
+  done < <(claude_project_dirs_for_path "$p")
+  return 1
 }
 
 is_valid_uuid() {
@@ -912,9 +942,13 @@ capture_resume_id_from_pane() {
 
 capture_resume_id_from_claude_files() {
   local proj_dir newest sid
-  proj_dir=$(claude_project_dir_for_path "$AGENT_PATH") || return 1
-  [ -d "$proj_dir" ] || return 1
-  newest=$(find "$proj_dir" -maxdepth 1 -name "*.jsonl" -type f -mmin -10 2>/dev/null | sort -r | head -1)
+  newest=""
+  while IFS= read -r proj_dir; do
+    [ -n "$proj_dir" ] || continue
+    [ -d "$proj_dir" ] || continue
+    newest=$(find "$proj_dir" -maxdepth 1 -name "*.jsonl" -type f -mmin -10 2>/dev/null | sort -r | head -1)
+    [ -n "$newest" ] && break
+  done < <(claude_project_dirs_for_path "$AGENT_PATH")
   [ -n "$newest" ] || return 1
   sid=$(basename "$newest" .jsonl)
   if echo "$sid" | grep -qE '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'; then

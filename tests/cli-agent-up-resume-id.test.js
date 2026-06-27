@@ -237,6 +237,26 @@ function seedCodexSession(homeDir, workdir, sessionId, agentName) {
   ].join('\n'));
 }
 
+function claudeProjectSegment(workdir) {
+  return workdir.replace(/[^A-Za-z0-9-]/g, '-');
+}
+
+function seedClaudeSession(homeDir, workdir, sessionId, agentName) {
+  const projectDir = path.join(homeDir, '.claude', 'projects', claudeProjectSegment(workdir));
+  mkdirSync(projectDir, { recursive: true });
+  const filePath = path.join(projectDir, `${sessionId}.jsonl`);
+  writeFileSync(filePath, [
+    JSON.stringify({
+      cwd: workdir,
+      sessionId,
+      type: 'user',
+      message: { role: 'user', content: `Your name is ${agentName}.` },
+    }),
+    '',
+  ].join('\n'));
+  return filePath;
+}
+
 afterEach(() => {
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
   cleanupDirs.clear();
@@ -289,6 +309,30 @@ describe('agentchat up --resume-id', () => {
     expect(readFileSync(path.join(agentDir, 'tmp', 'launch-codex.sh'), 'utf-8')).toContain(`exec codex resume ${sessionId}`);
     expect(readFileSync(tmuxLog, 'utf-8')).toContain('launch-codex.sh');
     expect(out).toContain(`Resuming codex session: ${sessionId}`);
+  });
+
+  test('claude resume validation accepts sanitized project directory names', () => {
+    const { agentchatBin, env, runtimeDir, homeDir, tmuxLog } = setupSandbox();
+    const agentName = 'demo-agent';
+    const sessionId = 'cccccccc-dddd-eeee-ffff-111111111111';
+    const workdir = path.join(homeDir, '.agentchat', 'agents', 'agent_demo-agent', 'workdir');
+    mkdirSync(path.join(runtimeDir, 'data', 'agents', agentName), { recursive: true });
+    mkdirSync(workdir, { recursive: true });
+    seedClaudeSession(homeDir, workdir, sessionId, agentName);
+    writeFileSync(path.join(runtimeDir, 'data', 'agents', agentName, 'resume-id'), `${sessionId}\n`);
+    writeFileSync(path.join(runtimeDir, 'data', 'agents', agentName, 'meta.json'), JSON.stringify({
+      name: agentName,
+      path: workdir,
+      type: 'claude',
+    }, null, 2));
+
+    const out = runCli(agentchatBin, ['up', agentName], env);
+
+    const launchScript = path.join(runtimeDir, 'data', 'agents', agentName, 'tmp', 'launch-claude.sh');
+    expect(existsSync(launchScript)).toBe(true);
+    expect(readFileSync(launchScript, 'utf-8')).toContain(`exec claude --resume ${sessionId}`);
+    expect(readFileSync(tmuxLog, 'utf-8')).toContain('launch-claude.sh');
+    expect(out).toContain(`Resuming claude session: ${sessionId}`);
   });
 
   test('up-v1 rejects --resume-id with --fresh before provisioning', () => {

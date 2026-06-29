@@ -73,6 +73,7 @@ MANAGED_SPECS=(
   "bin/agent-send:bin/agent-send"
   "bin/agent-service:bin/agent-service"
   "remote/bin/agent-up:bin/agent-up"
+  "remote/bin/agent-register-tmux:bin/agent-register-tmux"
   "bin/agent-update:bin/agent-update"
   "bin/self-time-reminder:bin/self-time-reminder"
   "bin/verify-remote:bin/verify-remote"

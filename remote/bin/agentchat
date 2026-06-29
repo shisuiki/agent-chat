@@ -20,6 +20,7 @@ Usage: agentchat <command> [args]
 
 Core:
   up             Start or resume an agent
+  register-tmux  Register an existing tmux session
   down           Stop an agent
   ls             List agents
   send           Send message to target pane
@@ -63,6 +64,7 @@ shift
 
 case "$cmd" in
   up) dispatch "agent-up" "$@" ;;
+  register-tmux) dispatch "agent-register-tmux" "$@" ;;
   down) dispatch "agent-down" "$@" ;;
   ls|list) dispatch "agent-ls" "$@" ;;
   send) dispatch "agent-send" "$@" ;;

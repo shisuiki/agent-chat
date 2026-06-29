@@ -9,6 +9,7 @@ MIRROR_FILES=(
   "bin/agent-chat"
   "bin/agent-chat-cli"
   "bin/agent-down"
+  "bin/agent-register-tmux"
   "bin/agent-ls"
   "bin/agent-maintain"
   "bin/agent-send"

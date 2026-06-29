@@ -4,6 +4,7 @@
       "cli": "bin/agentchat",
       "commands": [
         { "command": "up", "target": "agent-up" },
+        { "command": "register-tmux", "target": "agent-register-tmux" },
         { "command": "up-v1", "target": "agent-up-v1", "aliases": ["v1-up"] },
         { "command": "project", "target": "agent-project" },
         { "command": "graph", "target": "agent-graph" },
@@ -28,6 +29,10 @@
         {
           "command": "up",
           "mustContain": ["--resume-id", "explicit session UUID to resume for a new backend identity"]
+        },
+        {
+          "command": "register-tmux",
+          "mustContain": ["Register an existing tmux session", "does not start a process", "global MCP server"]
         },
         {
           "command": "up-v1",
@@ -55,6 +60,7 @@
       "cli": "remote/bin/agentchat",
       "commands": [
         { "command": "up", "target": "agent-up" },
+        { "command": "register-tmux", "target": "agent-register-tmux" },
         { "command": "down", "target": "agent-down" },
         { "command": "ls", "target": "agent-ls", "aliases": ["list"] },
         { "command": "send", "target": "agent-send" },
@@ -80,6 +86,10 @@
         {
           "command": "up",
           "mustContain": ["--resume-id", "explicit session UUID to resume for a new backend identity"]
+        },
+        {
+          "command": "register-tmux",
+          "mustContain": ["Register an existing tmux session", "does not start a process", "global MCP server"]
         },
         {
           "command": "service",

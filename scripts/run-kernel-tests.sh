@@ -146,6 +146,7 @@ start_shard "contracts and cli" \
   tests/cli-agent-project.test.js \
   tests/cli-agent-graph.test.js \
   tests/cli-agent-ls.test.js \
+  tests/cli-register-tmux.test.js \
   tests/cli-agent-up-resume-id.test.js \
   tests/cli-agent-status.test.js \
   tests/cli-fleet.test.js \

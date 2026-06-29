@@ -91,6 +91,7 @@ echo "Checking generated remote package shape..."
 for required in \
   "bin/agentchat" \
   "bin/agent-up" \
+  "bin/agent-register-tmux" \
   "push-relay.js" \
   "push-relay-autodeploy.service" \
   "mcp-server.js" \

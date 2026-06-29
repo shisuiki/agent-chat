@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_resolve_script_dir() {
+  local src="$0"
+  while [ -L "$src" ]; do
+    local dir
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+SCRIPT_DIR="$(_resolve_script_dir)"
+BASE_DIR="$(dirname "$SCRIPT_DIR")"
+
+ENV_FILE="$BASE_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+fi
+
+RUNTIME_DIR="${AGENT_CHAT_RUNTIME_DIR:-$BASE_DIR}"
+DATA_DIR="$RUNTIME_DIR/data/agents"
+
+if [ "$RUNTIME_DIR" != "$BASE_DIR" ] && [ -f "$RUNTIME_DIR/.env" ]; then
+  set -a
+  source "$RUNTIME_DIR/.env"
+  set +a
+fi
+
+BACKEND_PORT_RAW="${AGENT_CHAT_BACKEND_PORT:-8090}"
+if [[ "$BACKEND_PORT_RAW" =~ ^[0-9]+$ ]] && [ "$BACKEND_PORT_RAW" -gt 0 ]; then
+  BACKEND_PORT="$BACKEND_PORT_RAW"
+else
+  BACKEND_PORT="8090"
+fi
+BACKEND_URL="${AGENT_CHAT_API:-http://127.0.0.1:$BACKEND_PORT}"
+SERVER_ID="${AGENT_CHAT_SERVER:-}"
+API_TOKEN="${API_TOKEN:-}"
+AUTH_HEADER=""
+[ -n "$API_TOKEN" ] && AUTH_HEADER="Authorization: Bearer $API_TOKEN"
+
+usage() {
+  cat <<'USAGE'
+Usage: agentchat register-tmux <session> [path] [agent|claude|codex]
+
+Register an existing tmux session as an Agent Chat-visible runtime target.
+
+This does not start a process, inject prompts, write MCP config, or bind the
+global MCP server. It only writes local metadata and registers the tmux target
+with the backend.
+
+Arguments:
+  session      existing tmux session name
+  path         workspace path; defaults to pane 0 current path when available
+  type         agent (default), claude, or codex
+USAGE
+}
+
+api_curl() {
+  if [ -n "$AUTH_HEADER" ]; then
+    curl --noproxy '*' -sS -H "$AUTH_HEADER" "$@"
+  else
+    curl --noproxy '*' -sS "$@"
+  fi
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+if [ $# -lt 1 ]; then
+  usage >&2
+  exit 1
+fi
+
+NAME="$1"
+shift
+AGENT_PATH=""
+TYPE="agent"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    agent|claude|codex)
+      TYPE="$1"
+      shift
+      ;;
+    -*)
+      echo "Error: unrecognized option '$1'" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      if [ -z "$AGENT_PATH" ]; then
+        AGENT_PATH="$1"
+        shift
+      else
+        echo "Error: unrecognized argument '$1'" >&2
+        usage >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [ -z "${NAME// }" ]; then
+  echo "Error: session name is required." >&2
+  exit 1
+fi
+
+TMUX_TARGET="=${NAME}"
+TMUX_PANE_TARGET="=${NAME}:0.0"
+if ! tmux has-session -t "$TMUX_TARGET" 2>/dev/null; then
+  echo "Error: tmux session '$NAME' does not exist on this host." >&2
+  echo "This command only registers already-running tmux sessions." >&2
+  exit 1
+fi
+
+if [ -z "$AGENT_PATH" ]; then
+  AGENT_PATH="$(tmux display-message -p -t "$TMUX_PANE_TARGET" '#{pane_current_path}' 2>/dev/null || true)"
+fi
+
+if [ -z "$AGENT_PATH" ]; then
+  echo "Error: path not specified and tmux pane current path is unavailable." >&2
+  echo "Usage: agentchat register-tmux <session> <path> [agent|claude|codex]" >&2
+  exit 1
+fi
+
+AGENT_PATH="$(cd "$AGENT_PATH" 2>/dev/null && pwd -P || echo "$AGENT_PATH")"
+if [ ! -d "$AGENT_PATH" ]; then
+  echo "Error: path '$AGENT_PATH' does not exist or is not a directory." >&2
+  exit 1
+fi
+
+AGENT_DATA="$DATA_DIR/$NAME"
+META_FILE="$AGENT_DATA/meta.json"
+
+NOW="$(python3 -c "from datetime import datetime; print(datetime.now().astimezone().isoformat())" 2>/dev/null || date -Iseconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S)"
+
+payload="$(NAME="$NAME" TYPE="$TYPE" TMUX="${NAME}:0.0" SERVER="$SERVER_ID" AGENT_PATH="$AGENT_PATH" python3 - <<'PY'
+import json
+import os
+
+payload = {
+    "name": os.environ["NAME"],
+    "type": os.environ["TYPE"],
+    "tmux": os.environ["TMUX"],
+    "manualDown": False,
+    "workdir": os.environ["AGENT_PATH"],
+}
+server = os.environ.get("SERVER", "").strip()
+if server:
+    payload["server"] = server
+print(json.dumps(payload))
+PY
+)"
+
+response="$(api_curl -X POST "$BACKEND_URL/api/agents" -H 'Content-Type: application/json' -d "$payload")"
+if ! printf '%s' "$response" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if not d.get("error") else 1)' 2>/dev/null; then
+  echo "Error: backend registration failed: $response" >&2
+  exit 1
+fi
+
+mkdir -p "$AGENT_DATA"
+META_FILE="$META_FILE" NAME="$NAME" AGENT_PATH="$AGENT_PATH" TYPE="$TYPE" NOW="$NOW" python3 - <<'PY'
+import json
+import os
+
+meta_file = os.environ["META_FILE"]
+try:
+    with open(meta_file, encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    data = {}
+
+data.update({
+    "name": os.environ["NAME"],
+    "path": os.environ["AGENT_PATH"],
+    "type": os.environ["TYPE"],
+    "managedLaunch": False,
+    "registeredFrom": "tmux",
+    "lastRegistered": os.environ["NOW"],
+})
+data.setdefault("createdAt", os.environ["NOW"])
+data.setdefault("sessionId", "")
+data.setdefault("model", "")
+data.setdefault("extraArgs", "")
+
+with open(meta_file, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2)
+    handle.write("\n")
+PY
+
+echo "Registered tmux session '$NAME' as Agent Chat target."
+echo "  Type: $TYPE"
+echo "  Tmux: ${NAME}:0.0"
+echo "  Path: $AGENT_PATH"
+echo "  Meta: $META_FILE"

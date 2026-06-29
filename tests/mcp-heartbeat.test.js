@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { spawn } from 'child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import http from 'http';
@@ -116,6 +118,7 @@ function spawnMcpServer(apiBase, extraEnv = {}, coreFile = 'lib/mcp-server-core.
     ...process.env,
     AGENT_NAME: 'alpha',
     AGENT_CHAT_API: apiBase,
+    AGENT_CHAT_RUNTIME_DIR: repoRoot,
     AGENT_CHAT_SERVER: 'local',
     API_TOKEN: 'test-token',
     MCP_HEARTBEAT_INTERVAL_MS: '100',
@@ -140,6 +143,47 @@ function spawnMcpServer(apiBase, extraEnv = {}, coreFile = 'lib/mcp-server-core.
   return { child, stderr: () => stderr.join('') };
 }
 
+async function withMcpClient(apiBase, extraEnv = {}, coreFile = 'lib/mcp-server-core.js', fn) {
+  const stderr = [];
+  const env = {
+    ...process.env,
+    AGENT_CHAT_API: apiBase,
+    API_TOKEN: 'test-token',
+    MCP_HEARTBEAT_INTERVAL_MS: '100',
+    MCP_FETCH_TIMEOUT_MS: '100',
+    MCP_FETCH_RETRIES: '1',
+    MCP_FETCH_BACKOFF_MS: '5',
+    NO_PROXY: '*',
+    ...extraEnv,
+  };
+  for (const key of [
+    'AGENT_NAME',
+    'AGENTCHAT_AGENT_STATE_DIR',
+    'AGENT_CHAT_RUNTIME_DIR',
+    'AGENTCHAT_HOMEDIR',
+    'TMUX',
+    'TMUX_PANE',
+  ]) {
+    if (env[key] === undefined) delete env[key];
+  }
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(repoRoot, coreFile)],
+    cwd: repoRoot,
+    env,
+    stderr: 'pipe',
+  });
+  transport.stderr?.setEncoding('utf-8');
+  transport.stderr?.on('data', chunk => stderr.push(chunk));
+  const client = new Client({ name: 'agent-chat-mcp-test', version: '1.0.0' });
+  await client.connect(transport);
+  try {
+    return await fn(client, () => stderr.join(''));
+  } finally {
+    await client.close();
+  }
+}
+
 afterEach(async () => {
   await Promise.all([...children].map(stopChild));
   await Promise.all([...servers].map(closeServer));
@@ -148,6 +192,71 @@ afterEach(async () => {
 });
 
 describe('MCP backend heartbeat', () => {
+  test('global unbound MCP rejects tools without registering or heartbeating', async () => {
+    const calls = [];
+    const running = await listen(async (req, res) => {
+      const body = await collectBody(req);
+      calls.push({ method: req.method, url: req.url, body });
+      res.setHeader('Content-Type', 'application/json');
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: 'unexpected backend call' }));
+    });
+
+    for (const coreFile of coreFiles) {
+      const before = calls.length;
+      const result = await withMcpClient(
+        `http://127.0.0.1:${running.port}`,
+        {
+          AGENT_NAME: undefined,
+          AGENTCHAT_AGENT_STATE_DIR: undefined,
+          AGENT_CHAT_RUNTIME_DIR: undefined,
+          AGENTCHAT_HOMEDIR: undefined,
+          TMUX: undefined,
+          TMUX_PANE: undefined,
+        },
+        coreFile,
+        async (client, stderr) => {
+          const out = await client.callTool({ name: 'whoami', arguments: {} });
+          expect(stderr()).toContain('not bound to Agent Chat member');
+          return out;
+        }
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Signal: not_agentchat_member');
+      expect(result.content[0].text).toContain('not bound to an Agent Chat-managed runtime');
+      expect(calls.length).toBe(before);
+    }
+  }, 10000);
+
+  test('AGENT_NAME alone is not enough to bind the global MCP server', async () => {
+    const calls = [];
+    const running = await listen(async (req, res) => {
+      const body = await collectBody(req);
+      calls.push({ method: req.method, url: req.url, body });
+      res.setHeader('Content-Type', 'application/json');
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: 'unexpected backend call' }));
+    });
+
+    const result = await withMcpClient(
+      `http://127.0.0.1:${running.port}`,
+      {
+        AGENT_NAME: 'alpha',
+        AGENTCHAT_AGENT_STATE_DIR: undefined,
+        AGENT_CHAT_RUNTIME_DIR: undefined,
+        AGENTCHAT_HOMEDIR: undefined,
+      },
+      'lib/mcp-server-core.js',
+      async client => client.callTool({ name: 'send_message', arguments: { to: 'beta', summary: 'x', full: 'y' } })
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Signal: not_agentchat_member');
+    expect(result.content[0].text).toContain('AGENT_NAME is set but no Agent Chat membership env was provided');
+    expect(calls).toHaveLength(0);
+  }, 10000);
+
   test('writes pid file under derived agent state dir when explicit state dir is missing', async () => {
     const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'agent-chat-mcp-pid-'));
     tempDirs.add(tempRoot);
